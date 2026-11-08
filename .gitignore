@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Secrets & Local runtime data
+.env
+bot_data.json
+*.log
+
+# OS & IDE
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

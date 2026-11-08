@@ -1,0 +1,24 @@
+{
+  "bot_token": "",
+  "chat_id": null,
+  "timezone": "Asia/Tashkent",
+  "admin_ids": [],
+  "mentions": [],
+  "escalation_minutes": 15,
+  "daily_report_time": "18:45",
+  "reminders": [
+    {"time": "09:20", "label": "утренний обход", "enabled": true},
+    {"time": "10:00", "label": "утренний обход", "enabled": true},
+    {"time": "11:00", "label": "утренний обход", "enabled": true},
+    {"time": "11:45", "label": "утренний обход", "enabled": true},
+    {"time": "12:30", "label": "утренний обход (перед обедом)", "enabled": true},
+    {"time": "14:00", "label": "послеобеденный обход", "enabled": true},
+    {"time": "14:45", "label": "послеобеденный обход", "enabled": true},
+    {"time": "15:30", "label": "послеобеденный обход", "enabled": true},
+    {"time": "16:15", "label": "послеобеденный обход", "enabled": true},
+    {"time": "17:00", "label": "послеобеденный обход", "enabled": true},
+    {"time": "17:45", "label": "послеобеденный обход", "enabled": true},
+    {"time": "18:30", "label": "финальный обход", "enabled": true}
+  ],
+  "days": "mon-sat"
+}
