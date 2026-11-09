@@ -7,6 +7,7 @@
   ],
   "mentions": [],
   "escalation_minutes": 15,
+  "advance_minutes": 5,
   "daily_report_time": "18:45",
   "message_template": "🔔 <b>Напоминание: пора на {label}!</b>\n⏰ Время: <b>{time}</b>\n👥 Ответственные: {mentions}",
   "reminders": [

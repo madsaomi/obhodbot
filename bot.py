@@ -312,10 +312,17 @@ async def send_reminder(bot: Bot, reminder_info: dict):
     time_str = reminder_info.get("time", now.strftime("%H:%M"))
     label = reminder_info.get("label", "обход")
 
-    reminder_card = (
-        f"🔔 <b>{time_str} — Время обхода!</b> ({label})\n"
-        f"👥 Дежурные: {mentions_str}"
-    )
+    advance = int(config.get("advance_minutes", 0))
+    if reminder_info.get("scheduled") and advance > 0:
+        reminder_card = (
+            f"🔔 <b>Через {advance} мин обход в {time_str}!</b> ({label})\n"
+            f"👥 Дежурные: {mentions_str}"
+        )
+    else:
+        reminder_card = (
+            f"🔔 <b>{time_str} — Время обхода!</b> ({label})\n"
+            f"👥 Дежурные: {mentions_str}"
+        )
 
     b = InlineKeyboardBuilder()
     b.button(
@@ -365,7 +372,12 @@ async def send_reminder(bot: Bot, reminder_info: dict):
 
 @dp.callback_query(F.data.startswith("confirm:"))
 async def cb_confirm_round(callback: CallbackQuery):
-    parts = callback.data.split(":")
+    # Формат: confirm:<YYYY-MM-DD>:<время>; во времени тоже есть двоеточие (09:20),
+    # поэтому делим только по первым двум
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer("⚠️ Некорректные данные кнопки.", show_alert=True)
+        return
     date_str, time_str = parts[1], parts[2]
 
     config = load_config()
@@ -643,6 +655,7 @@ async def cmd_status(message: Message):
         f"👥 <b>Штат сотрудников:</b> {mentions}\n"
         f"⏰ <b>Активных обходов:</b> {active_count} из {len(reminders)}\n"
         f"⏱ <b>Время на реакцию:</b> {config.get('escalation_minutes', 15)} мин\n"
+        f"🔔 <b>Напоминание заранее:</b> за {config.get('advance_minutes', 0)} мин\n"
         f"📅 <b>Рабочие дни:</b> Понедельник — Суббота\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -712,6 +725,7 @@ async def cb_admin_status(callback: CallbackQuery):
         f"👑 <b>Администраторов:</b> {len(admins)}\n"
         f"⏰ <b>Обходов:</b> {active} активных (из {len(reminders)})\n"
         f"⏱ <b>Таймаут тревоги:</b> {config.get('escalation_minutes', 15)} мин\n"
+        f"🔔 <b>Напоминание заранее:</b> за {config.get('advance_minutes', 0)} мин\n"
         f"📋 <b>Ежедневный отчёт:</b> в {config.get('daily_report_time', '18:45')}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -1317,6 +1331,8 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
     days = config.get("days", "mon-sat")
     reminders = config.get("reminders", [])
 
+    advance = max(0, int(config.get("advance_minutes", 0)))
+
     count = 0
     for r in reminders:
         if not r.get("enabled", True):
@@ -1326,11 +1342,15 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
             continue
         try:
             hour, minute = map(int, time_str.split(":"))
-            trigger = CronTrigger(day_of_week=days, hour=hour, minute=minute, timezone=tz)
+            # Напоминание приходит заранее: за advance минут до времени обхода
+            # (не раньше 00:00 того же дня, чтобы не сбить день недели)
+            fire_total = max(0, hour * 60 + minute - advance)
+            fire_hour, fire_minute = divmod(fire_total, 60)
+            trigger = CronTrigger(day_of_week=days, hour=fire_hour, minute=fire_minute, timezone=tz)
             scheduler.add_job(
                 send_reminder,
                 trigger=trigger,
-                args=[bot, r],
+                args=[bot, {**r, "scheduled": True}],
                 name=f"Reminder_{time_str}",
                 id=f"rem_job_{time_str}",
                 replace_existing=True

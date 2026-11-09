@@ -5,6 +5,7 @@
   "admin_ids": [],
   "mentions": [],
   "escalation_minutes": 15,
+  "advance_minutes": 5,
   "daily_report_time": "18:45",
   "reminders": [
     {"time": "09:20", "label": "утренний обход", "enabled": true},
