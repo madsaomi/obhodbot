@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime, timedelta
+from html import escape as h
 import pytz
 from dotenv import load_dotenv
 
@@ -48,8 +50,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
-DATA_PATH = os.path.join(os.path.dirname(__file__), "bot_data.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_data_dir() -> str:
+    """Папка для config.json и bot_data.json.
+
+    DATA_DIR из окружения > /data (постоянное хранилище Amvera/Docker-том) > папка бота.
+    """
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir:
+        return env_dir
+    if sys.platform != "win32" and os.path.isdir("/data"):
+        return "/data"
+    return BASE_DIR
+
+
+DATA_DIR = resolve_data_dir()
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+DATA_PATH = os.path.join(DATA_DIR, "bot_data.json")
+
+
+def ensure_config_exists():
+    """При первом запуске в новой папке данных копирует туда стартовый конфиг."""
+    if os.path.exists(CONFIG_PATH):
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    for name in ("config.json", "config.example.json"):
+        src = os.path.join(BASE_DIR, name)
+        if os.path.exists(src) and os.path.abspath(src) != os.path.abspath(CONFIG_PATH):
+            shutil.copyfile(src, CONFIG_PATH)
+            logger.info(f"Создан {CONFIG_PATH} из {name}")
+            return
 
 
 # ==============================================================================
@@ -95,20 +127,55 @@ def get_today_data(tz) -> tuple[str, dict]:
             "duty_users": [],
             "rounds": {}
         }
+        prune_old_days(data, tz)
         save_data(data)
     return date_str, data[date_str]
 
 
+def prune_old_days(data: dict, tz):
+    """Удаляет из bot_data.json дни старше keep_days (по умолчанию 90)."""
+    keep_days = int(load_config().get("keep_days", 90))
+    if keep_days <= 0:
+        return
+    cutoff = (datetime.now(tz) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    for key in [k for k in data if k < cutoff]:
+        del data[key]
+
+
+DAY_NAMES = {"mon": "Пн", "tue": "Вт", "wed": "Ср", "thu": "Чт", "fri": "Пт", "sat": "Сб", "sun": "Вс"}
+
+
+def format_days(days: str) -> str:
+    """'mon-sat' -> 'Пн–Сб', 'mon,wed,fri' -> 'Пн, Ср, Пт'."""
+    parts = []
+    for part in str(days).lower().split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            parts.append(f"{DAY_NAMES.get(a, a)}–{DAY_NAMES.get(b, b)}")
+        elif part:
+            parts.append(DAY_NAMES.get(part, part))
+    return ", ".join(parts) or str(days)
+
+
 def is_admin(user_id: int) -> bool:
-    config = load_config()
-    admin_ids = config.get("admin_ids", [])
-    if not admin_ids:
-        admin_ids.append(user_id)
-        config["admin_ids"] = admin_ids
-        save_config(config)
-        logger.info(f"Пользователь {user_id} назначен администратором.")
-        return True
-    return user_id in admin_ids
+    """Админы задаются только вручную в admin_ids (config.json)."""
+    return user_id in load_config().get("admin_ids", [])
+
+
+# Кнопки, доступные всем сотрудникам; все остальные callback'и — только админам
+PUBLIC_CALLBACKS = {"already_done", "claim_duty_self", "unclaim_duty_self"}
+PUBLIC_CALLBACK_PREFIXES = ("confirm:",)
+
+
+async def admin_callback_guard(handler, event: CallbackQuery, data: dict):
+    cb_data = event.data or ""
+    if cb_data in PUBLIC_CALLBACKS or cb_data.startswith(PUBLIC_CALLBACK_PREFIXES):
+        return await handler(event, data)
+    if not is_admin(event.from_user.id):
+        await event.answer("⛔️ Доступно только администраторам.", show_alert=True)
+        return None
+    return await handler(event, data)
 
 
 # FSM-состояния
@@ -134,6 +201,7 @@ class AddMentionState(StatesGroup):
 
 # Глобальные объекты
 dp = Dispatcher(storage=MemoryStorage())
+dp.callback_query.outer_middleware(admin_callback_guard)
 scheduler_instance: AsyncIOScheduler = None
 
 
@@ -267,8 +335,8 @@ async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label:
     timeout = config.get("escalation_minutes", 15)
 
     alert_card = (
-        f"⚠️ <b>{time_str} — Обход не подтверждён!</b> ({label})\n"
-        f"👥 Дежурные: {mentions_str}\n"
+        f"⚠️ <b>{h(time_str)} — Обход не подтверждён!</b> ({h(label)})\n"
+        f"👥 Дежурные: {h(mentions_str)}\n"
         f"<i>Прошло {timeout} минут, никто не подтвердил выход на обход.</i>"
     )
 
@@ -280,8 +348,8 @@ async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label:
 
     admin_card = (
         f"🚨 <b>[Тревога руководству]</b>\n"
-        f"Обход в <b>{time_str}</b> ({label}) не подтверждён вовремя!\n"
-        f"Дежурные: {mentions_str}"
+        f"Обход в <b>{h(time_str)}</b> ({h(label)}) не подтверждён вовремя!\n"
+        f"Дежурные: {h(mentions_str)}"
     )
     for a_id in admin_ids:
         try:
@@ -315,13 +383,13 @@ async def send_reminder(bot: Bot, reminder_info: dict):
     advance = int(config.get("advance_minutes", 0))
     if reminder_info.get("scheduled") and advance > 0:
         reminder_card = (
-            f"🔔 <b>Через {advance} мин обход в {time_str}!</b> ({label})\n"
-            f"👥 Дежурные: {mentions_str}"
+            f"🔔 <b>Через {advance} мин обход в {h(time_str)}!</b> ({h(label)})\n"
+            f"👥 Дежурные: {h(mentions_str)}"
         )
     else:
         reminder_card = (
-            f"🔔 <b>{time_str} — Время обхода!</b> ({label})\n"
-            f"👥 Дежурные: {mentions_str}"
+            f"🔔 <b>{h(time_str)} — Время обхода!</b> ({h(label)})\n"
+            f"👥 Дежурные: {h(mentions_str)}"
         )
 
     b = InlineKeyboardBuilder()
@@ -418,7 +486,7 @@ async def cb_confirm_round(callback: CallbackQuery):
         except Exception:
             pass
 
-    confirmed_card = f"✅ <b>{time_str} — Обход выполнил {username_str} в {confirm_time_str}</b>"
+    confirmed_card = f"✅ <b>{h(time_str)} — Обход выполнил {h(username_str)} в {confirm_time_str}</b>"
 
     try:
         # Убираем кнопку, чтобы чат оставался чистым и аккуратным
@@ -453,7 +521,7 @@ def generate_report_text(date_str: str) -> str:
     rounds = day_data.get("rounds", {})
     duty_users = day_data.get("duty_users", [])
 
-    duty_str = " ".join(duty_users) if duty_users else "Все сотрудники (общий график)"
+    duty_str = h(" ".join(duty_users)) if duty_users else "Все сотрудники (общий график)"
 
     total = len(rounds)
     confirmed = sum(1 for r in rounds.values() if r.get("status") == "confirmed")
@@ -465,23 +533,23 @@ def generate_report_text(date_str: str) -> str:
     lines = []
     for t in sorted(rounds.keys()):
         r = rounds[t]
-        lbl = r.get("label", "обход")
+        lbl = h(r.get("label", "обход").ljust(15))
         st = r.get("status")
         if st == "confirmed":
-            by = r.get("confirmed_by", "—")
+            by = h(r.get("confirmed_by", "—"))
             at = r.get("confirmed_at", "")
-            lines.append(f"🟢 <code>{t}</code> | {lbl.ljust(15)} | {by} ({at})")
+            lines.append(f"🟢 <code>{h(t)}</code> | {lbl} | {by} ({at})")
         elif st == "missed":
-            lines.append(f"🔴 <code>{t}</code> | {lbl.ljust(15)} | <b>ПРОПУЩЕН</b>")
+            lines.append(f"🔴 <code>{h(t)}</code> | {lbl} | <b>ПРОПУЩЕН</b>")
         else:
-            lines.append(f"🟡 <code>{t}</code> | {lbl.ljust(15)} | <i>Ожидает</i>")
+            lines.append(f"🟡 <code>{h(t)}</code> | {lbl} | <i>Ожидает</i>")
 
     details = "\n".join(lines) if lines else "<i>Обходы за сегодня ещё не проводились.</i>"
 
     return (
         "📊 <b>ИТОГОВЫЙ ОТЧЁТ ЗА СМЕНУ</b>\n"
         f"📅 <b>Дата:</b> <code>{date_str}</code>\n"
-        f"🕒 <b>Время выгрузки:</b> <code>{now.strftime('%H:%M:%S')}</code> (Ташкент)\n"
+        f"🕒 <b>Время выгрузки:</b> <code>{now.strftime('%H:%M:%S')}</code> ({h(tz_name)})\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👮‍♂️ <b>Дежурные:</b> {duty_str}\n\n"
         "📈 <b>Результаты:</b>\n"
@@ -586,7 +654,7 @@ async def cmd_duty_open(message: Message):
     duty_users = day_data.get("duty_users", [])
 
     if duty_users:
-        duty_text = f"🟢 <b>На смене сейчас:</b> {' '.join(duty_users)}"
+        duty_text = f"🟢 <b>На смене сейчас:</b> {h(' '.join(duty_users))}"
     else:
         duty_text = "⚪️ <i>Дежурные на сегодня ещё не выбраны (уведомления приходят всем сотрудникам).</i>"
 
@@ -609,17 +677,26 @@ async def cmd_duty_open(message: Message):
 @dp.message(F.text == "🔔 Тестовый обход")
 @dp.message(Command("test"))
 async def cmd_test_open(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.reply("⛔️ Тестовый обход доступен только администраторам.")
+        return
     test_reminder = {"time": "ТЕСТ", "label": "пробный обход для проверки"}
     await send_reminder(bot, test_reminder)
 
 
 @dp.message(Command("setchat"))
 async def cmd_setchat(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.reply("⛔️ Привязать группу может только администратор бота.")
+        return
+    if message.chat.type == "private":
+        await message.reply("⚠️ Команду /setchat нужно отправить в рабочей группе, а не в личке.")
+        return
     config = load_config()
     config["chat_id"] = message.chat.id
     save_config(config)
 
-    chat_name = message.chat.title if message.chat.title else "текущая группа"
+    chat_name = h(message.chat.title) if message.chat.title else "текущая группа"
     await message.reply(
         "🎉 <b>Группа успешно привязана к боту!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -640,8 +717,8 @@ async def cmd_status(message: Message):
 
     chat_id = config.get("chat_id")
     chat_info = f"<code>{chat_id}</code>" if chat_id else "⚠️ <i>Не привязана (напишите /setchat в группе)</i>"
-    mentions = " ".join(config.get("mentions", [])) if config.get("mentions") else "—"
-    duty_users = " ".join(day_data.get("duty_users", [])) or "Все по общему списку"
+    mentions = h(" ".join(config.get("mentions", []))) if config.get("mentions") else "—"
+    duty_users = h(" ".join(day_data.get("duty_users", []))) or "Все по общему списку"
 
     reminders = config.get("reminders", [])
     active_count = sum(1 for r in reminders if r.get("enabled", True))
@@ -649,14 +726,14 @@ async def cmd_status(message: Message):
     card = (
         "ℹ️ <b>ТЕКУЩИЙ СТАТУС СИСТЕМЫ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕒 <b>Время в Ташкенте:</b> <code>{now.strftime('%d.%m.%Y %H:%M:%S')}</code>\n"
+        f"🕒 <b>Текущее время:</b> <code>{now.strftime('%d.%m.%Y %H:%M:%S')}</code> ({h(tz_name)})\n"
         f"📍 <b>Привязанный чат:</b> {chat_info}\n"
         f"👮‍♂️ <b>Дежурные сегодня:</b> {duty_users}\n"
         f"👥 <b>Штат сотрудников:</b> {mentions}\n"
         f"⏰ <b>Активных обходов:</b> {active_count} из {len(reminders)}\n"
         f"⏱ <b>Время на реакцию:</b> {config.get('escalation_minutes', 15)} мин\n"
         f"🔔 <b>Напоминание заранее:</b> за {config.get('advance_minutes', 0)} мин\n"
-        f"📅 <b>Рабочие дни:</b> Понедельник — Суббота\n"
+        f"📅 <b>Рабочие дни:</b> {h(format_days(config.get('days', 'mon-sat')))}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     await message.reply(card, parse_mode=ParseMode.HTML)
@@ -714,13 +791,14 @@ async def cb_admin_status(callback: CallbackQuery):
     admins = config.get("admin_ids", [])
     reminders = config.get("reminders", [])
     active = sum(1 for r in reminders if r.get("enabled", True))
-    mentions = " ".join(config.get("mentions", [])) or "не указаны"
+    mentions = h(" ".join(config.get("mentions", []))) or "не указаны"
 
     card = (
         "ℹ️ <b>СОСТОЯНИЕ СИСТЕМЫ</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕒 <b>Время в Ташкенте:</b> <code>{now.strftime('%d.%m.%Y %H:%M:%S')}</code>\n"
+        f"🕒 <b>Текущее время:</b> <code>{now.strftime('%d.%m.%Y %H:%M:%S')}</code> ({h(tz_name)})\n"
         f"📍 <b>ID группы:</b> <code>{chat_id}</code>\n"
+        f"📅 <b>Рабочие дни:</b> {h(format_days(config.get('days', 'mon-sat')))}\n"
         f"👥 <b>Сотрудников:</b> {mentions}\n"
         f"👑 <b>Администраторов:</b> {len(admins)}\n"
         f"⏰ <b>Обходов:</b> {active} активных (из {len(reminders)})\n"
@@ -827,7 +905,7 @@ async def cb_claim_duty_self(callback: CallbackQuery):
         else:
             await callback.answer("Вас не было в списке дежурных.", show_alert=False)
 
-    cur_text = " ".join(duty_users) if duty_users else "не назначены"
+    cur_text = h(" ".join(duty_users)) if duty_users else "не назначены"
     card = (
         "📋 <b>График дежурства на сегодня</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -901,6 +979,9 @@ async def cb_add_reminder(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AddReminderState.waiting_for_time)
 async def process_reminder_time(message: Message, state: FSMContext):
+    if not message.text:
+        await message.reply("⚠️ Отправьте время текстом в формате <b>ЧЧ:ММ</b>:")
+        return
     time_str = message.text.strip()
     if ":" not in time_str or len(time_str.split(":")) != 2:
         await message.reply("⚠️ Неверный формат. Введите время в формате <b>ЧЧ:ММ</b> (например: <code>13:00</code>):")
@@ -913,6 +994,11 @@ async def process_reminder_time(message: Message, state: FSMContext):
         formatted_time = f"{h:02d}:{m:02d}"
     except ValueError:
         await message.reply("⚠️ Часы от 0 до 23, минуты от 0 до 59. Попробуйте еще раз:")
+        return
+
+    existing = {r.get("time") for r in load_config().get("reminders", [])}
+    if formatted_time in existing:
+        await message.reply(f"⚠️ Обход в <b>{formatted_time}</b> уже есть в графике. Введите другое время:")
         return
 
     await state.update_data(time=formatted_time)
@@ -928,7 +1014,10 @@ async def process_reminder_time(message: Message, state: FSMContext):
 @dp.message(AddReminderState.waiting_for_label)
 async def process_reminder_label(message: Message, state: FSMContext, bot: Bot):
     global scheduler_instance
-    label = message.text.strip()
+    if not message.text or not message.text.strip():
+        await message.reply("⚠️ Отправьте название обхода текстом:")
+        return
+    label = message.text.strip()[:64]
     data = await state.get_data()
     formatted_time = data["time"]
 
@@ -944,7 +1033,7 @@ async def process_reminder_label(message: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
     await message.answer(
-        f"🎉 Обход <b>{formatted_time}</b> ({label}) успешно добавлен в расписание!",
+        f"🎉 Обход <b>{formatted_time}</b> ({h(label)}) успешно добавлен в расписание!",
         reply_markup=get_admin_inline_menu(),
         parse_mode=ParseMode.HTML
     )
@@ -999,7 +1088,7 @@ async def cb_del_reminder_confirm(callback: CallbackQuery, bot: Bot):
 async def cb_admin_mentions(callback: CallbackQuery):
     config = load_config()
     mentions = config.get("mentions", [])
-    mentions_text = "\n".join([f"• <b>{m}</b>" for m in mentions]) if mentions else "<i>Список пока пуст</i>"
+    mentions_text = "\n".join([f"• <b>{h(m)}</b>" for m in mentions]) if mentions else "<i>Список пока пуст</i>"
 
     card = (
         "👥 <b>Штат ответственных сотрудников</b>\n"
@@ -1025,6 +1114,9 @@ async def cb_add_mention(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AddMentionState.waiting_for_username)
 async def process_add_mention(message: Message, state: FSMContext):
+    if not message.text or not message.text.split():
+        await message.reply("⚠️ Отправьте юзернейм текстом, например <code>@username</code>:")
+        return
     parts = message.text.split()
     new_mentions = [p if p.startswith("@") else f"@{p}" for p in parts]
 
@@ -1039,7 +1131,7 @@ async def process_add_mention(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        f"✅ Добавлены сотрудники:\n{' '.join(new_mentions)}",
+        f"✅ Добавлены сотрудники:\n{h(' '.join(new_mentions))}",
         reply_markup=get_admin_inline_menu(),
         parse_mode=ParseMode.HTML
     )
@@ -1105,13 +1197,16 @@ async def cb_admin_announcement(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AnnouncementState.waiting_for_content)
 async def process_announcement_content(message: Message, state: FSMContext):
+    # html_text сохраняет форматирование (жирный, ссылки) и экранирует спецсимволы
     if message.photo:
         photo_id = message.photo[-1].file_id
-        caption = message.caption or ""
+        caption = message.html_text if message.caption else ""
         await state.update_data(type="photo", photo_id=photo_id, text=caption)
+    elif message.text:
+        await state.update_data(type="text", text=message.html_text)
     else:
-        text = message.text or message.html_text or ""
-        await state.update_data(type="text", text=text)
+        await message.reply("⚠️ Поддерживается только текст или фото с подписью. Отправьте ещё раз:")
+        return
 
     await state.set_state(AnnouncementState.confirm)
 
@@ -1206,6 +1301,9 @@ async def cb_admin_poll(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(PollState.waiting_for_question)
 async def process_poll_question(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        await message.reply("⚠️ Отправьте вопрос текстом:")
+        return
     question = message.text.strip()
     if len(question) > 300:
         await message.reply(f"⚠️ Вопрос слишком длинный ({len(question)} симв.). В Telegram лимит 300 символов. Сократите:")
@@ -1214,7 +1312,7 @@ async def process_poll_question(message: Message, state: FSMContext):
     await state.update_data(question=question)
     await state.set_state(PollState.waiting_for_options)
     card = (
-        f"❓ Вопрос: <b>{question}</b>\n\n"
+        f"❓ Вопрос: <b>{h(question)}</b>\n\n"
         "Шаг 2: Введите <b>варианты ответов</b> (каждый вариант с новой строки, от 2 до 10 вариантов):\n\n"
         "<i>Пример:</i>\n"
         "Да, готов\n"
@@ -1226,7 +1324,10 @@ async def process_poll_question(message: Message, state: FSMContext):
 
 @dp.message(PollState.waiting_for_options)
 async def process_poll_options(message: Message, state: FSMContext):
-    lines = [line.strip() for line in message.text.split("\n") if line.strip()]
+    if not message.text:
+        await message.reply("⚠️ Отправьте варианты ответов текстом, каждый с новой строки:")
+        return
+    lines =[line.strip() for line in message.text.split("\n") if line.strip()]
     if len(lines) < 2:
         await message.reply("⚠️ Укажите как минимум 2 варианта ответа (каждый с новой строки):")
         return
@@ -1236,14 +1337,14 @@ async def process_poll_options(message: Message, state: FSMContext):
 
     long_options = [opt for opt in lines if len(opt) > 100]
     if long_options:
-        await message.reply(f"⚠️ Вариант не должен превышать 100 символов:\n<i>{long_options[0][:40]}...</i>")
+        await message.reply(f"⚠️ Вариант не должен превышать 100 символов:\n<i>{h(long_options[0][:40])}...</i>")
         return
 
     await state.update_data(options=lines)
     await state.set_state(PollState.confirm)
 
     data = await state.get_data()
-    options_preview = "\n".join([f"• {opt}" for opt in lines])
+    options_preview = "\n".join([f"• {h(opt)}" for opt in lines])
 
     b = InlineKeyboardBuilder()
     b.row(
@@ -1254,7 +1355,7 @@ async def process_poll_options(message: Message, state: FSMContext):
     card = (
         "👁 <b>ПРЕДПРОСМОТР ОПРОСА:</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❓ <b>Вопрос:</b> {data['question']}\n\n"
+        f"❓ <b>Вопрос:</b> {h(data['question'])}\n\n"
         f"📝 <b>Варианты ответов:</b>\n{options_preview}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Опубликовать опрос в группе?"
@@ -1323,8 +1424,57 @@ async def cb_confirm_call_now(callback: CallbackQuery, bot: Bot):
 # НАСТРОЙКА РАСПИСАНИЯ И МЕНЮ КОМАНД
 # ==============================================================================
 
+def restore_pending_escalations(scheduler: AsyncIOScheduler, bot: Bot):
+    """После перезапуска заново ставит 15-минутные проверки для неподтверждённых обходов.
+
+    Сегодняшние: если срок ещё не вышел — проверка в срок, если вышел — сразу.
+    Обходы прошлых дней просто помечаются пропущенными, без рассылки тревог.
+    """
+    config = load_config()
+    tz = pytz.timezone(config.get("timezone", "Asia/Tashkent"))
+    timeout = config.get("escalation_minutes", 15)
+    now = datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+
+    data = load_data()
+    changed = False
+    restored = 0
+    for date_str, day_data in data.items():
+        for time_str, info in day_data.get("rounds", {}).items():
+            if info.get("status") != "pending":
+                continue
+            if date_str < today:
+                info["status"] = "missed"
+                changed = True
+                continue
+            if date_str > today:
+                continue
+            try:
+                sent_at = tz.localize(datetime.strptime(f"{date_str} {info.get('sent_at')}", "%Y-%m-%d %H:%M:%S"))
+            except (TypeError, ValueError):
+                sent_at = now
+            run_date = max(sent_at + timedelta(minutes=timeout), now + timedelta(seconds=5))
+            scheduler.add_job(
+                check_unconfirmed_round,
+                trigger="date",
+                run_date=run_date,
+                args=[bot, date_str, time_str, info.get("label", "обход"), info.get("mentions", "")],
+                id=f"escalation_{date_str}_{time_str}",
+                replace_existing=True
+            )
+            restored += 1
+    if changed:
+        save_data(data)
+    if restored:
+        logger.info(f"Восстановлено проверок неподтверждённых обходов: {restored}")
+
+
 def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
-    scheduler.remove_all_jobs()
+    # Пересоздаём только расписание и отчёт; задачи escalation_* (идущие
+    # 15-минутные проверки) не трогаем, иначе тревоги терялись бы
+    for job in scheduler.get_jobs():
+        if job.id.startswith("rem_job_") or job.id == "daily_report_job":
+            scheduler.remove_job(job.id)
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
     tz = pytz.timezone(tz_name)
@@ -1390,7 +1540,7 @@ async def register_bot_commands(bot: Bot):
         BotCommand(command="duty", description="👮‍♂️ Кто на смене / Заступить"),
         BotCommand(command="report", description="📋 Отчёт по обходам за сегодня"),
         BotCommand(command="setchat", description="📌 Привязать эту группу"),
-        BotCommand(command="status", description="ℹ️ Время в Ташкенте и график"),
+        BotCommand(command="status", description="ℹ️ Статус системы, время и график"),
         BotCommand(command="test", description="🔔 Проверить оповещение")
     ]
     try:
@@ -1401,7 +1551,14 @@ async def register_bot_commands(bot: Bot):
 
 
 async def main():
+    ensure_config_exists()
+    logger.info(f"Папка данных: {DATA_DIR}")
     config = load_config()
+    if not config.get("admin_ids"):
+        logger.warning(
+            "Список admin_ids пуст: админ-панель никому не доступна. "
+            "Впишите свой Telegram ID в admin_ids в config.json и перезапустите бота."
+        )
     token = (os.getenv("BOT_TOKEN") or config.get("bot_token", "")).strip()
 
     if not token or token == "ВСТАВЬТЕ_ТОКЕН_СЮДА" or token == "YOUR_BOT_TOKEN_HERE":
@@ -1420,6 +1577,7 @@ async def main():
     scheduler = AsyncIOScheduler(timezone=tz)
     scheduler_instance = scheduler
     setup_jobs(scheduler, bot)
+    restore_pending_escalations(scheduler, bot)
     scheduler.start()
 
     logger.info("Бот успешно запущен и ожидает сообщений...")

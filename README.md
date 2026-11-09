@@ -66,7 +66,16 @@ cp .env.example .env
 BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
 ```
 
-### 3. Установка зависимостей и запуск
+### 3. Назначение администратора
+Впишите свой Telegram ID в `admin_ids` в `config.json` (узнать ID можно, например, у @userinfobot).
+Админы задаются только вручную: без этого админ-панель, `/setchat` и `/test` никому не доступны.
+
+Полезные настройки в `config.json`:
+* `advance_minutes` — за сколько минут до обхода присылать напоминание (по умолчанию 5).
+* `escalation_minutes` — через сколько минут без подтверждения поднимать тревогу.
+* `keep_days` — сколько дней хранить историю в `bot_data.json` (0 — не удалять).
+
+### 4. Установка зависимостей и запуск
 
 #### На Windows:
 Просто запустите файл:
@@ -85,8 +94,14 @@ python bot.py
 #### Через Docker:
 ```bash
 docker build -t telegram-obhod-bot .
-docker run -d --restart=always --name obhod-bot telegram-obhod-bot
+docker run -d --restart=always --name obhod-bot --env-file .env -v obhod-data:/data telegram-obhod-bot
 ```
+`.env` не попадает в образ, токен передаётся через `--env-file`. Настройки и история хранятся в томе `/data`:
+при первом запуске туда копируется `config.json` из образа, дальше бот работает с копией в томе.
+
+#### Amvera:
+Бот автоматически использует постоянное хранилище `/data` (`persistenceMount` в `amvera.yml`),
+поэтому настройки и история переживают передеплой. Токен задайте переменной окружения `BOT_TOKEN`.
 
 ---
 

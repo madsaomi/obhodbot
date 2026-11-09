@@ -2,3 +2,10 @@
 __pycache__
 *.pyc
 *.log
+.git
+.env
+bot_data.json
+run.bat
+run_silent.vbs
+add_to_startup.bat
+remove_from_startup.bat
