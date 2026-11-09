@@ -9,3 +9,5 @@ run.bat
 run_silent.vbs
 add_to_startup.bat
 remove_from_startup.bat
+bot.lock
+pending_deletes.json

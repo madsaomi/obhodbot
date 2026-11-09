@@ -17,3 +17,9 @@ bot_data.json
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# Runtime files
+bot.lock
+pending_deletes.json
+*.tmp
+*.corrupt-*

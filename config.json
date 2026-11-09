@@ -15,6 +15,7 @@
     "18:45"
   ],
   "keep_days": 90,
+  "group_autodelete_seconds": 120,
   "reminders": [
     {
       "time": "09:20",

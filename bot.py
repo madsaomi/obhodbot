@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
+import time
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from html import escape as h
 import pytz
 from dotenv import load_dotenv
@@ -20,8 +23,9 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -69,6 +73,56 @@ def resolve_data_dir() -> str:
 DATA_DIR = resolve_data_dir()
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 DATA_PATH = os.path.join(DATA_DIR, "bot_data.json")
+DELETES_PATH = os.path.join(DATA_DIR, "pending_deletes.json")
+LOCK_PATH = os.path.join(DATA_DIR, "bot.lock")
+LOG_PATH = os.path.join(DATA_DIR, "bot.log")
+
+# Лог дублируется в файл: при фоновом запуске (run_silent.vbs) консоли нет
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _file_handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_file_handler)
+except OSError as _e:
+    logger.warning(f"Не удалось открыть файл лога {LOG_PATH}: {_e}")
+
+
+_lock_file = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """Не даёт запустить вторую копию бота с той же папкой данных (иначе всё дублируется)."""
+    global _lock_file
+    _lock_file = open(LOCK_PATH, "a+")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            _lock_file.seek(0)
+            msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _lock_file.close()
+        _lock_file = None
+        return False
+    return True
+
+
+async def tg_retry(call, *args, attempts: int = 3, **kwargs):
+    """Вызов Telegram API с повторами при сбое сети/сервера или флуд-лимите."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            last_exc, delay = e, e.retry_after + 1
+        except (TelegramNetworkError, TelegramServerError) as e:
+            last_exc, delay = e, 3 * attempt
+        if attempt < attempts:
+            logger.warning(f"Сбой связи с Telegram ({last_exc}), повтор {attempt + 1}/{attempts} через {delay} с")
+            await asyncio.sleep(delay)
+    raise last_exc
 
 
 def ensure_config_exists():
@@ -88,16 +142,38 @@ def ensure_config_exists():
 # УПРАВЛЕНИЕ ДАННЫМИ
 # ==============================================================================
 
+def atomic_write_json(path: str, obj):
+    """Пишет во временный файл и подменяет им основной: при сбое старый файл остаётся целым."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def backup_corrupt_file(path: str) -> str:
+    backup = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        shutil.copyfile(path, backup)
+    except OSError:
+        pass
+    return backup
+
+
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         raise FileNotFoundError(f"Файл {CONFIG_PATH} не найден!")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.critical(f"config.json повреждён ({e}). Исправьте файл или восстановите из config.example.json.")
+        raise
 
 
 def save_config(config: dict):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    atomic_write_json(CONFIG_PATH, config)
 
 
 def load_data() -> dict:
@@ -106,13 +182,15 @@ def load_data() -> dict:
     try:
         with open(DATA_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Не теряем историю молча: сохраняем копию повреждённого файла
+        backup = backup_corrupt_file(DATA_PATH)
+        logger.error(f"bot_data.json повреждён ({e}). Копия сохранена в {backup}, начинаю с пустых данных.")
         return {}
 
 
 def save_data(data: dict):
-    with open(DATA_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(DATA_PATH, data)
 
 
 def get_today_str(tz) -> str:
@@ -176,6 +254,109 @@ async def admin_callback_guard(handler, event: CallbackQuery, data: dict):
         await event.answer("⛔️ Доступно только администраторам.", show_alert=True)
         return None
     return await handler(event, data)
+
+
+# ==============================================================================
+# ТИХИЙ РЕЖИМ ДЛЯ ГРУПП
+# ==============================================================================
+
+_background_tasks: set = set()
+
+
+def group_autodelete_delay() -> int:
+    return int(load_config().get("group_autodelete_seconds", 120))
+
+
+def _load_pending_deletes() -> list[dict]:
+    try:
+        with open(DELETES_PATH, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        return items if isinstance(items, list) else []
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return []
+
+
+def _forget_pending_deletes(chat_id: int, message_ids: list[int]):
+    drop = {(chat_id, mid) for mid in message_ids}
+    items = [it for it in _load_pending_deletes() if (it.get("chat_id"), it.get("message_id")) not in drop]
+    try:
+        atomic_write_json(DELETES_PATH, items)
+    except OSError as e:
+        logger.warning(f"Не удалось обновить список удалений: {e}")
+
+
+async def _delete_later(bot: Bot, chat_id: int, message_ids: list[int], delay: float):
+    await asyncio.sleep(max(0, delay))
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception as e:
+            # Чужие сообщения бот удаляет, только если он админ группы с правом удаления;
+            # сообщения старше 48 часов Telegram удалить не даёт
+            logger.debug(f"Не удалось удалить сообщение {mid}: {e}")
+    _forget_pending_deletes(chat_id, message_ids)
+
+
+def _start_delete_task(bot: Bot, chat_id: int, message_ids: list[int], delay: float):
+    task = asyncio.create_task(_delete_later(bot, chat_id, message_ids, delay))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def schedule_delete(bot: Bot, chat_id: int, message_ids: list[int], delay: int):
+    """Удаляет сообщения через delay секунд. План сохраняется на диск и переживает перезапуск."""
+    if delay <= 0 or not message_ids:
+        return
+    due = time.time() + delay
+    items = _load_pending_deletes()
+    items += [{"chat_id": chat_id, "message_id": mid, "at": due} for mid in message_ids]
+    try:
+        atomic_write_json(DELETES_PATH, items)
+    except OSError as e:
+        logger.warning(f"Не удалось сохранить список удалений: {e}")
+    _start_delete_task(bot, chat_id, message_ids, delay)
+
+
+def restore_pending_deletes(bot: Bot):
+    """После перезапуска доудаляет сообщения, которые бот не успел убрать."""
+    items = _load_pending_deletes()
+    now = time.time()
+    for it in items:
+        try:
+            _start_delete_task(bot, int(it["chat_id"]), [int(it["message_id"])], float(it.get("at", now)) - now)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if items:
+        logger.info(f"Восстановлено отложенных удалений сообщений: {len(items)}")
+
+
+def schedule_group_cleanup(message: Message, *sent: Message):
+    """В группах удаляет команду пользователя и ответ бота через group_autodelete_seconds."""
+    if message.chat.type == "private":
+        return
+    ids = [message.message_id] + [m.message_id for m in sent if m is not None]
+    schedule_delete(message.bot, message.chat.id, ids, group_autodelete_delay())
+
+
+async def deny_if_not_allowed(message: Message) -> bool:
+    """Отчёт, статус и дежурства видны только админам и в привязанной рабочей группе.
+
+    Возвращает True, если доступ запрещён (ответ уже отправлен).
+    """
+    if message.from_user and is_admin(message.from_user.id):
+        return False
+    chat_id = load_config().get("chat_id")
+    if message.chat.type != "private" and chat_id and message.chat.id == chat_id:
+        return False
+    await group_reply(message, "⛔️ Эта команда доступна только в рабочей группе или администраторам.")
+    return True
+
+
+async def group_reply(message: Message, text: str, **kwargs) -> Message:
+    """reply(), который в группе потом сам убирает и команду, и ответ."""
+    sent = await message.reply(text, **kwargs)
+    schedule_group_cleanup(message, sent)
+    return sent
 
 
 # FSM-состояния
@@ -258,9 +439,11 @@ def get_schedule_keyboard() -> InlineKeyboardMarkup:
     reminders = config.get("reminders", [])
     b = InlineKeyboardBuilder()
 
-    for idx, r in enumerate(reminders):
+    # В кнопках — время обхода, а не номер в списке: старая клавиатура
+    # не сработает на другой обход после добавления/удаления
+    for r in reminders:
         icon = "✅ ВКЛ" if r.get("enabled", True) else "❌ ВЫКЛ"
-        b.button(text=f"{r.get('time')}  {icon}", callback_data=f"toggle_rem_{idx}")
+        b.button(text=f"{r.get('time')}  {icon}", callback_data=f"toggle_rem_{r.get('time')}")
 
     b.adjust(2)
     b.row(
@@ -294,9 +477,9 @@ def get_duty_keyboard() -> InlineKeyboardMarkup:
     all_staff = config.get("mentions", [])
 
     b = InlineKeyboardBuilder()
-    for idx, staff in enumerate(all_staff):
+    for staff in all_staff:
         status = "✅ НА СМЕНЕ" if staff in duty_users else "❌ ВЫХОДНОЙ"
-        b.button(text=f"{staff}: {status}", callback_data=f"toggle_duty_{idx}")
+        b.button(text=f"{staff}: {status}", callback_data=f"toggle_duty_{staff_key(staff)}")
 
     b.adjust(1)
     b.row(
@@ -304,6 +487,19 @@ def get_duty_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="◀️ Назад в меню", callback_data="admin_main")
     )
     return b.as_markup()
+
+
+def staff_key(name: str) -> str:
+    """Короткий стабильный ключ сотрудника для callback_data (лимит Telegram — 64 байта)."""
+    return hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+
+
+def find_staff(mentions: list[str], key: str):
+    return next((m for m in mentions if staff_key(m) == key), None)
+
+
+def find_reminder(reminders: list[dict], time_str: str):
+    return next((r for r in reminders if r.get("time") == time_str), None)
 
 
 def get_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -340,20 +536,46 @@ async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label:
         f"<i>Прошло {timeout} минут, никто не подтвердил выход на обход.</i>"
     )
 
-    if chat_id:
-        try:
-            await bot.send_message(chat_id=chat_id, text=alert_card, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error(f"Ошибка отправки тревоги: {e}")
+    is_test = round_kind(time_str, round_info) == "test"
+    # Карточка живёт в том чате, куда её отправили (chat_id мог смениться)
+    card_chat_id = round_info.get("chat_id", chat_id)
+
+    if card_chat_id:
+        # Не плодим сообщения: превращаем само напоминание в тревогу,
+        # кнопка подтверждения остаётся (можно подтвердить с опозданием)
+        b = InlineKeyboardBuilder()
+        b.button(text="✅ Я на обходе", callback_data=f"confirm:{date_str}:{time_str}")
+        edited = False
+        message_id = round_info.get("message_id")
+        if message_id:
+            try:
+                await tg_retry(
+                    bot.edit_message_text,
+                    chat_id=card_chat_id, message_id=message_id, text=alert_card,
+                    reply_markup=b.as_markup(), parse_mode=ParseMode.HTML
+                )
+                edited = True
+            except Exception as e:
+                logger.warning(f"Не удалось обновить карточку обхода: {e}")
+        if is_test:
+            # Тестовую карточку не оставляем в группе навсегда
+            if message_id:
+                schedule_delete(bot, card_chat_id, [message_id], group_autodelete_delay())
+        elif not edited:
+            try:
+                await tg_retry(bot.send_message, chat_id=card_chat_id, text=alert_card,
+                               reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Ошибка отправки тревоги: {e}")
 
     admin_card = (
-        f"🚨 <b>[Тревога руководству]</b>\n"
+        f"🚨 <b>[Тревога руководству]</b>{' (тест)' if is_test else ''}\n"
         f"Обход в <b>{h(time_str)}</b> ({h(label)}) не подтверждён вовремя!\n"
         f"Дежурные: {h(mentions_str)}"
     )
     for a_id in admin_ids:
         try:
-            await bot.send_message(chat_id=a_id, text=admin_card, parse_mode=ParseMode.HTML)
+            await tg_retry(bot.send_message, chat_id=a_id, text=admin_card, parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка уведомления админа {a_id}: {e}")
 
@@ -377,11 +599,16 @@ async def send_reminder(bot: Bot, reminder_info: dict):
         all_mentions = config.get("mentions", [])
         mentions_str = " ".join(all_mentions) if all_mentions else "Все сотрудники"
 
-    time_str = reminder_info.get("time", now.strftime("%H:%M"))
+    kind = reminder_info.get("kind", "scheduled")
+    if kind == "emergency":
+        # У каждого срочного вызова свой ключ, чтобы второй вызов не затирал первый
+        time_str = f"срочно {now.strftime('%H:%M')}"
+    else:
+        time_str = reminder_info.get("time", now.strftime("%H:%M"))
     label = reminder_info.get("label", "обход")
 
     advance = int(config.get("advance_minutes", 0))
-    if reminder_info.get("scheduled") and advance > 0:
+    if kind == "scheduled" and reminder_info.get("scheduled") and advance > 0:
         reminder_card = (
             f"🔔 <b>Через {advance} мин обход в {h(time_str)}!</b> ({h(label)})\n"
             f"👥 Дежурные: {h(mentions_str)}"
@@ -399,7 +626,8 @@ async def send_reminder(bot: Bot, reminder_info: dict):
     )
 
     try:
-        sent = await bot.send_message(
+        sent = await tg_retry(
+            bot.send_message,
             chat_id=chat_id,
             text=reminder_card,
             reply_markup=b.as_markup(),
@@ -412,7 +640,9 @@ async def send_reminder(bot: Bot, reminder_info: dict):
             data[date_str] = {"duty_users": duty_users, "rounds": {}}
         data[date_str]["rounds"][time_str] = {
             "label": label,
+            "kind": kind,
             "status": "pending",
+            "chat_id": chat_id,
             "message_id": sent.message_id,
             "sent_at": now.strftime("%H:%M:%S"),
             "mentions": mentions_str
@@ -471,7 +701,10 @@ async def cb_confirm_round(callback: CallbackQuery):
     user = callback.from_user
     username_str = f"@{user.username}" if user.username else user.full_name
 
+    # Подтверждение после тревоги — это опоздание, его видно в карточке и отчёте
+    is_late = round_info.get("status") == "missed"
     round_info["status"] = "confirmed"
+    round_info["late"] = is_late
     round_info["confirmed_by"] = username_str
     round_info["confirmed_user_id"] = user.id
     round_info["confirmed_at"] = confirm_time_str
@@ -486,7 +719,8 @@ async def cb_confirm_round(callback: CallbackQuery):
         except Exception:
             pass
 
-    confirmed_card = f"✅ <b>{h(time_str)} — Обход выполнил {h(username_str)} в {confirm_time_str}</b>"
+    late_note = " (с опозданием)" if is_late else ""
+    confirmed_card = f"✅ <b>{h(time_str)} — Обход выполнил {h(username_str)} в {confirm_time_str}{late_note}</b>"
 
     try:
         # Убираем кнопку, чтобы чат оставался чистым и аккуратным
@@ -498,7 +732,11 @@ async def cb_confirm_round(callback: CallbackQuery):
     except Exception as e:
         logger.warning(f"Ошибка обновления карточки: {e}")
 
-    await callback.answer(f"✅ Обход в {time_str} принят! Отличная работа.", show_alert=False)
+    # Тестовую карточку после проверки убираем из группы
+    if round_kind(time_str, round_info) == "test" and callback.message and callback.message.chat.type != "private":
+        schedule_delete(callback.bot, callback.message.chat.id, [callback.message.message_id], group_autodelete_delay())
+
+    await callback.answer(f"✅ Обход в {time_str} принят{late_note}!", show_alert=False)
 
 
 @dp.callback_query(F.data == "already_done")
@@ -509,6 +747,54 @@ async def cb_already_done(callback: CallbackQuery):
 # ==============================================================================
 # ОТЧЁТНОСТЬ
 # ==============================================================================
+
+def round_kind(key: str, round_info: dict) -> str:
+    """scheduled / test / emergency; старые записи без поля kind определяем по ключу."""
+    kind = round_info.get("kind")
+    if kind:
+        return kind
+    if key == "ТЕСТ":
+        return "test"
+    if key == "СЕЙЧАС" or key.startswith("срочно"):
+        return "emergency"
+    return "scheduled"
+
+
+def is_working_day(config: dict, dt: datetime) -> bool:
+    start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        trigger = CronTrigger(day_of_week=config.get("days", "mon-sat"), hour=0, minute=0, timezone=dt.tzinfo)
+        nxt = trigger.get_next_fire_time(None, start)
+    except Exception:
+        return True
+    return nxt is not None and nxt.date() == start.date()
+
+
+def get_unsent_rounds(config: dict, date_str: str, recorded: dict) -> list[tuple[str, str]]:
+    """Обходы сегодняшнего графика, время напоминания которых прошло, а записи нет.
+
+    Так в отчёте видно, что бот был выключен или группа не привязана.
+    """
+    tz = pytz.timezone(config.get("timezone", "Asia/Tashkent"))
+    now = datetime.now(tz)
+    if date_str != now.strftime("%Y-%m-%d") or not is_working_day(config, now):
+        return []
+    advance = max(0, int(config.get("advance_minutes", 0)))
+    result = []
+    for r in config.get("reminders", []):
+        t = r.get("time", "")
+        if not r.get("enabled", True) or t in recorded or ":" not in t:
+            continue
+        try:
+            hh, mm = map(int, t.split(":"))
+        except ValueError:
+            continue
+        fire_total = max(0, hh * 60 + mm - advance)
+        fire_at = now.replace(hour=fire_total // 60, minute=fire_total % 60, second=0, microsecond=0)
+        if now >= fire_at + timedelta(minutes=2):
+            result.append((t, r.get("label", "обход")))
+    return result
+
 
 def get_report_times(config: dict) -> list[str]:
     """Время автоотчётов: daily_report_times (список) или старое daily_report_time."""
@@ -531,28 +817,49 @@ def generate_report_text(date_str: str, title: str = "ОТЧЁТ ЗА СМЕНУ
 
     duty_str = h(" ".join(duty_users)) if duty_users else "Все сотрудники (общий график)"
 
-    total = len(rounds)
-    confirmed = sum(1 for r in rounds.values() if r.get("status") == "confirmed")
-    missed = sum(1 for r in rounds.values() if r.get("status") == "missed")
-    pending = total - confirmed - missed
+    # В статистику идут только обходы по графику; тесты не считаются вовсе,
+    # срочные вызовы показываются отдельным списком
+    scheduled = {t: r for t, r in rounds.items() if round_kind(t, r) == "scheduled"}
+    emergency = {t: r for t, r in rounds.items() if round_kind(t, r) == "emergency"}
+    unsent = get_unsent_rounds(config, date_str, scheduled)
 
-    percent = int((confirmed / total * 100)) if total > 0 else 0
+    on_time = sum(1 for r in scheduled.values() if r.get("status") == "confirmed" and not r.get("late"))
+    late = sum(1 for r in scheduled.values() if r.get("status") == "confirmed" and r.get("late"))
+    missed = sum(1 for r in scheduled.values() if r.get("status") == "missed")
+    pending = sum(1 for r in scheduled.values() if r.get("status") not in ("confirmed", "missed"))
+    total = len(scheduled) + len(unsent)
 
-    lines = []
-    for t in sorted(rounds.keys()):
-        r = rounds[t]
+    percent = int((on_time / total * 100)) if total > 0 else 0
+
+    def fmt_line(t: str, r: dict) -> str:
         lbl = h(r.get("label", "обход").ljust(15))
         st = r.get("status")
         if st == "confirmed":
             by = h(r.get("confirmed_by", "—"))
             at = r.get("confirmed_at", "")
-            lines.append(f"🟢 <code>{h(t)}</code> | {lbl} | {by} ({at})")
-        elif st == "missed":
-            lines.append(f"🔴 <code>{h(t)}</code> | {lbl} | <b>ПРОПУЩЕН</b>")
-        else:
-            lines.append(f"🟡 <code>{h(t)}</code> | {lbl} | <i>Ожидает</i>")
+            if r.get("late"):
+                return f"🟠 <code>{h(t)}</code> | {lbl} | {by} ({at}, с опозданием)"
+            return f"🟢 <code>{h(t)}</code> | {lbl} | {by} ({at})"
+        if st == "missed":
+            return f"🔴 <code>{h(t)}</code> | {lbl} | <b>ПРОПУЩЕН</b>"
+        return f"🟡 <code>{h(t)}</code> | {lbl} | <i>Ожидает</i>"
 
-    details = "\n".join(lines) if lines else "<i>Обходы за сегодня ещё не проводились.</i>"
+    entries = [(t, fmt_line(t, r)) for t, r in scheduled.items()]
+    entries += [(t, f"⚫ <code>{h(t)}</code> | {h(lbl.ljust(15))} | <b>НЕ ОТПРАВЛЕНО</b> (бот был недоступен)")
+                for t, lbl in unsent]
+    details = "\n".join(line for _, line in sorted(entries)) if entries else "<i>Обходы за сегодня ещё не проводились.</i>"
+
+    extra = ""
+    if emergency:
+        extra = (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🚨 <b>Внеплановые вызовы:</b>\n"
+            + "\n".join(fmt_line(t, r) for t, r in sorted(emergency.items()))
+            + "\n"
+        )
+
+    unsent_line = f"• Не отправлено:  <b>{len(unsent)}</b> ⚫\n" if unsent else ""
+    late_line = f"• С опозданием:  <b>{late}</b> 🟠\n" if late else ""
 
     return (
         f"📊 <b>{title}</b>\n"
@@ -562,12 +869,15 @@ def generate_report_text(date_str: str, title: str = "ОТЧЁТ ЗА СМЕНУ
         f"👮‍♂️ <b>Дежурные:</b> {duty_str}\n\n"
         "📈 <b>Результаты:</b>\n"
         f"• Всего обходов: <b>{total}</b>\n"
-        f"• Выполнено:  <b>{confirmed}</b> ({percent}%) 🟢\n"
+        f"• Выполнено вовремя:  <b>{on_time}</b> ({percent}%) 🟢\n"
+        f"{late_line}"
         f"• Пропущено:  <b>{missed}</b> 🔴\n"
+        f"{unsent_line}"
         f"• В процессе:  <b>{pending}</b> 🟡\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📋 <b>Хронология:</b>\n"
         f"{details}\n"
+        f"{extra}"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -583,16 +893,20 @@ async def send_daily_report(bot: Bot, is_final: bool = True):
     chat_id = config.get("chat_id")
     admin_ids = config.get("admin_ids", [])
 
-    if chat_id:
+    # Промежуточный отчёт — только руководству в личку; в группу идёт лишь итоговый.
+    # Отчёты несрочные, поэтому отправляются без звука.
+    if chat_id and is_final:
         try:
-            await bot.send_message(chat_id=chat_id, text=report_text, parse_mode=ParseMode.HTML)
+            await tg_retry(bot.send_message, chat_id=chat_id, text=report_text,
+                                   parse_mode=ParseMode.HTML, disable_notification=True)
             logger.info(f"Отчет отправлен в чат {chat_id}")
         except Exception as e:
             logger.error(f"Ошибка отправки отчета в группу: {e}")
 
     for a_id in admin_ids:
         try:
-            await bot.send_message(chat_id=a_id, text=report_text, parse_mode=ParseMode.HTML)
+            await tg_retry(bot.send_message, chat_id=a_id, text=report_text,
+                                   parse_mode=ParseMode.HTML, disable_notification=True)
         except Exception as e:
             logger.error(f"Ошибка отправки отчета админу {a_id}: {e}")
 
@@ -610,7 +924,7 @@ async def cmd_start(message: Message):
             "и формирую ежедневную отчетность для руководства.\n\n"
             "🎛 <b>Быстрый доступ:</b> используйте кнопки внизу экрана или команду /admin."
         )
-        await message.reply(welcome, reply_markup=get_admin_bottom_keyboard(), parse_mode=ParseMode.HTML)
+        await group_reply(message, welcome, reply_markup=get_admin_bottom_keyboard(), parse_mode=ParseMode.HTML)
     else:
         group_welcome = (
             "👋 <b>Бот контроля обходов активен в группе!</b>\n\n"
@@ -619,7 +933,7 @@ async def cmd_start(message: Message):
             "• <code>/report</code> — отчёт по обходам за сегодня\n"
             "• <code>/status</code> — статус системы и точное время"
         )
-        await message.reply(group_welcome, parse_mode=ParseMode.HTML)
+        await group_reply(message, group_welcome, parse_mode=ParseMode.HTML)
 
 
 # Обработка нажатий на постоянные кнопки внизу экрана
@@ -627,11 +941,11 @@ async def cmd_start(message: Message):
 @dp.message(Command("admin"))
 async def cmd_admin_open(message: Message, state: FSMContext):
     if message.chat.type != "private":
-        await message.reply("⚠️ Панель управления доступна только в личных сообщениях с ботом.")
+        await group_reply(message, "⚠️ Панель управления доступна только в личных сообщениях с ботом.")
         return
 
     if not is_admin(message.from_user.id):
-        await message.reply("⛔️ Доступ ограничен только для администраторов.")
+        await group_reply(message, "⛔️ Доступ ограничен только для администраторов.")
         return
 
     await state.clear()
@@ -646,16 +960,20 @@ async def cmd_admin_open(message: Message, state: FSMContext):
 @dp.message(F.text == "📋 Отчёт за сегодня")
 @dp.message(Command("report"))
 async def cmd_report_open(message: Message):
+    if await deny_if_not_allowed(message):
+        return
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
     tz = pytz.timezone(tz_name)
     date_str = get_today_str(tz)
-    await message.reply(generate_report_text(date_str), parse_mode=ParseMode.HTML)
+    await group_reply(message, generate_report_text(date_str), parse_mode=ParseMode.HTML)
 
 
 @dp.message(F.text == "👮‍♂️ Кто на смене")
 @dp.message(Command("duty"))
 async def cmd_duty_open(message: Message):
+    if await deny_if_not_allowed(message):
+        return
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
     tz = pytz.timezone(tz_name)
@@ -680,33 +998,35 @@ async def cmd_duty_open(message: Message):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<i>Нажмите кнопку ниже, чтобы заступить или сдать смену:</i>"
     )
-    await message.reply(card, reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
+    await group_reply(message, card, reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
 
 
 @dp.message(F.text == "🔔 Тестовый обход")
 @dp.message(Command("test"))
 async def cmd_test_open(message: Message, bot: Bot):
     if not is_admin(message.from_user.id):
-        await message.reply("⛔️ Тестовый обход доступен только администраторам.")
+        await group_reply(message, "⛔️ Тестовый обход доступен только администраторам.")
         return
-    test_reminder = {"time": "ТЕСТ", "label": "пробный обход для проверки"}
+    test_reminder = {"time": "ТЕСТ", "label": "пробный обход для проверки", "kind": "test"}
     await send_reminder(bot, test_reminder)
+    schedule_group_cleanup(message)  # саму команду /test в группе тоже убираем
 
 
 @dp.message(Command("setchat"))
 async def cmd_setchat(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
-        await message.reply("⛔️ Привязать группу может только администратор бота.")
+        await group_reply(message, "⛔️ Привязать группу может только администратор бота.")
         return
     if message.chat.type == "private":
-        await message.reply("⚠️ Команду /setchat нужно отправить в рабочей группе, а не в личке.")
+        await group_reply(message, "⚠️ Команду /setchat нужно отправить в рабочей группе, а не в личке.")
         return
     config = load_config()
     config["chat_id"] = message.chat.id
     save_config(config)
 
     chat_name = h(message.chat.title) if message.chat.title else "текущая группа"
-    await message.reply(
+    await group_reply(
+        message,
         "🎉 <b>Группа успешно привязана к боту!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏷 <b>Чат:</b> {chat_name}\n"
@@ -718,6 +1038,8 @@ async def cmd_setchat(message: Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
+    if await deny_if_not_allowed(message):
+        return
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
     tz = pytz.timezone(tz_name)
@@ -745,7 +1067,7 @@ async def cmd_status(message: Message):
         f"📅 <b>Рабочие дни:</b> {h(format_days(config.get('days', 'mon-sat')))}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    await message.reply(card, parse_mode=ParseMode.HTML)
+    await group_reply(message, card, parse_mode=ParseMode.HTML)
 
 
 # ==============================================================================
@@ -842,12 +1164,12 @@ async def cb_admin_duty_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("toggle_duty_"))
 async def cb_toggle_duty(callback: CallbackQuery):
-    idx = int(callback.data.split("_")[2])
+    key = callback.data[len("toggle_duty_"):]
     config = load_config()
     all_staff = config.get("mentions", [])
+    target = find_staff(all_staff, key)
 
-    if 0 <= idx < len(all_staff):
-        target = all_staff[idx]
+    if target:
         tz_name = config.get("timezone", "Asia/Tashkent")
         tz = pytz.timezone(tz_name)
         date_str, day_data = get_today_data(tz)
@@ -867,7 +1189,8 @@ async def cb_toggle_duty(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=get_duty_keyboard())
         await callback.answer(msg)
     else:
-        await callback.answer("Ошибка индекса")
+        await callback.message.edit_reply_markup(reply_markup=get_duty_keyboard())
+        await callback.answer("Этого сотрудника уже нет в списке — список обновлён.", show_alert=True)
 
 
 @dp.callback_query(F.data == "reset_duty")
@@ -902,7 +1225,11 @@ async def cb_claim_duty_self(callback: CallbackQuery):
             duty_users.append(username_str)
             data[date_str]["duty_users"] = duty_users
             save_data(data)
-            await callback.answer(f"✅ Вы заступили на смену: {username_str}", show_alert=True)
+            # Текст всплывашки ограничен 200 символами, поэтому подсказка короткая
+            no_username_hint = (
+                "\n\n⚠️ Нет @username — бот не сможет вас отметить. Задайте его в настройках Telegram."
+            ) if not user.username else ""
+            await callback.answer(f"✅ Вы на смене: {username_str[:40]}{no_username_hint}", show_alert=True)
         else:
             await callback.answer("Вы уже находитесь на смене!", show_alert=False)
     else:
@@ -953,13 +1280,14 @@ async def cb_admin_schedule(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("toggle_rem_"))
 async def cb_toggle_reminder(callback: CallbackQuery, bot: Bot):
     global scheduler_instance
-    idx = int(callback.data.split("_")[2])
+    time_key = callback.data[len("toggle_rem_"):]
     config = load_config()
     reminders = config.get("reminders", [])
+    reminder = find_reminder(reminders, time_key)
 
-    if 0 <= idx < len(reminders):
-        current = reminders[idx].get("enabled", True)
-        reminders[idx]["enabled"] = not current
+    if reminder:
+        current = reminder.get("enabled", True)
+        reminder["enabled"] = not current
         config["reminders"] = reminders
         save_config(config)
 
@@ -968,9 +1296,10 @@ async def cb_toggle_reminder(callback: CallbackQuery, bot: Bot):
 
         await callback.message.edit_reply_markup(reply_markup=get_schedule_keyboard())
         status_text = "ВКЛЮЧЕНО ✅" if not current else "ОТКЛЮЧЕНО ❌"
-        await callback.answer(f"{reminders[idx]['time']}: {status_text}")
+        await callback.answer(f"{time_key}: {status_text}")
     else:
-        await callback.answer("Ошибка")
+        await callback.message.edit_reply_markup(reply_markup=get_schedule_keyboard())
+        await callback.answer("Этого обхода уже нет в графике — список обновлён.", show_alert=True)
 
 
 @dp.callback_query(F.data == "add_reminder")
@@ -997,10 +1326,11 @@ async def process_reminder_time(message: Message, state: FSMContext):
         return
 
     try:
-        h, m = map(int, time_str.split(":"))
-        if not (0 <= h <= 23 and 0 <= m <= 59):
+        # hh/mm, а не h/m: h — это функция экранирования HTML
+        hh, mm = map(int, time_str.split(":"))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
             raise ValueError
-        formatted_time = f"{h:02d}:{m:02d}"
+        formatted_time = f"{hh:02d}:{mm:02d}"
     except ValueError:
         await message.reply("⚠️ Часы от 0 до 23, минуты от 0 до 59. Попробуйте еще раз:")
         return
@@ -1048,14 +1378,13 @@ async def process_reminder_label(message: Message, state: FSMContext, bot: Bot):
     )
 
 
-@dp.callback_query(F.data == "del_reminder_menu")
-async def cb_del_reminder_menu(callback: CallbackQuery):
+async def render_del_reminder_menu(callback: CallbackQuery):
     config = load_config()
     reminders = config.get("reminders", [])
     b = InlineKeyboardBuilder()
 
-    for idx, r in enumerate(reminders):
-        b.button(text=f"🗑 {r.get('time')} - {r.get('label', '')[:10]}", callback_data=f"del_rem_{idx}")
+    for r in reminders:
+        b.button(text=f"🗑 {r.get('time')} - {r.get('label', '')[:10]}", callback_data=f"del_rem_{r.get('time')}")
 
     b.adjust(2)
     b.row(InlineKeyboardButton(text="◀️ Назад к графику", callback_data="admin_schedule"))
@@ -1065,28 +1394,35 @@ async def cb_del_reminder_menu(callback: CallbackQuery):
         reply_markup=b.as_markup(),
         parse_mode=ParseMode.HTML
     )
+
+
+@dp.callback_query(F.data == "del_reminder_menu")
+async def cb_del_reminder_menu(callback: CallbackQuery):
+    await render_del_reminder_menu(callback)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("del_rem_"))
 async def cb_del_reminder_confirm(callback: CallbackQuery, bot: Bot):
     global scheduler_instance
-    idx = int(callback.data.split("_")[2])
+    time_key = callback.data[len("del_rem_"):]
     config = load_config()
     reminders = config.get("reminders", [])
+    reminder = find_reminder(reminders, time_key)
 
-    if 0 <= idx < len(reminders):
-        deleted = reminders.pop(idx)
+    if reminder:
+        reminders.remove(reminder)
         config["reminders"] = reminders
         save_config(config)
 
         if scheduler_instance:
             setup_jobs(scheduler_instance, bot)
 
-        await callback.answer(f"Удалено: {deleted['time']}")
-        await cb_del_reminder_menu(callback)
+        await render_del_reminder_menu(callback)
+        await callback.answer(f"Удалено: {time_key}")
     else:
-        await callback.answer("Ошибка")
+        await render_del_reminder_menu(callback)
+        await callback.answer("Этого обхода уже нет в графике — список обновлён.", show_alert=True)
 
 
 # ==============================================================================
@@ -1146,14 +1482,13 @@ async def process_add_mention(message: Message, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data == "del_mention_menu")
-async def cb_del_mention_menu(callback: CallbackQuery):
+async def render_del_mention_menu(callback: CallbackQuery):
     config = load_config()
     mentions = config.get("mentions", [])
     b = InlineKeyboardBuilder()
 
-    for idx, m in enumerate(mentions):
-        b.button(text=f"🗑 {m}", callback_data=f"del_mention_{idx}")
+    for m in mentions:
+        b.button(text=f"🗑 {m}", callback_data=f"del_mention_{staff_key(m)}")
 
     b.adjust(2)
     b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin_mentions"))
@@ -1163,23 +1498,30 @@ async def cb_del_mention_menu(callback: CallbackQuery):
         reply_markup=b.as_markup(),
         parse_mode=ParseMode.HTML
     )
+
+
+@dp.callback_query(F.data == "del_mention_menu")
+async def cb_del_mention_menu(callback: CallbackQuery):
+    await render_del_mention_menu(callback)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("del_mention_"))
 async def cb_del_mention(callback: CallbackQuery):
-    idx = int(callback.data.split("_")[2])
+    key = callback.data[len("del_mention_"):]
     config = load_config()
     mentions = config.get("mentions", [])
+    target = find_staff(mentions, key)
 
-    if 0 <= idx < len(mentions):
-        deleted = mentions.pop(idx)
+    if target:
+        mentions.remove(target)
         config["mentions"] = mentions
         save_config(config)
-        await callback.answer(f"Удален: {deleted}")
-        await cb_del_mention_menu(callback)
+        await render_del_mention_menu(callback)
+        await callback.answer(f"Удален: {target}")
     else:
-        await callback.answer("Ошибка")
+        await render_del_mention_menu(callback)
+        await callback.answer("Этого сотрудника уже нет в списке — список обновлён.", show_alert=True)
 
 
 # ==============================================================================
@@ -1229,18 +1571,20 @@ async def process_announcement_content(message: Message, state: FSMContext):
     )
 
     data = await state.get_data()
-    preview_header = "👁 <b>ПРЕДПРОСМОТР ОБЪЯВЛЕНИЯ:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    # Шапка отдельным сообщением: если приклеить её к тексту, длинное объявление
+    # (подпись до 1024, текст до 4096 символов) не влезет в лимит Telegram
+    await message.answer("👁 <b>ПРЕДПРОСМОТР ОБЪЯВЛЕНИЯ:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━", parse_mode=ParseMode.HTML)
 
     if data.get("type") == "photo":
         await message.answer_photo(
             photo=data["photo_id"],
-            caption=preview_header + (data.get("text") or ""),
+            caption=data.get("text") or None,
             reply_markup=b.as_markup(),
             parse_mode=ParseMode.HTML
         )
     else:
         await message.answer(
-            preview_header + (data.get("text") or ""),
+            data.get("text") or "",
             reply_markup=b.as_markup(),
             parse_mode=ParseMode.HTML
         )
@@ -1255,14 +1599,16 @@ async def cb_send_announcement(callback: CallbackQuery, state: FSMContext, bot: 
 
     try:
         if data.get("type") == "photo":
-            sent = await bot.send_photo(
+            sent = await tg_retry(
+            bot.send_photo,
                 chat_id=chat_id,
                 photo=data["photo_id"],
                 caption=data.get("text", ""),
                 parse_mode=ParseMode.HTML
             )
         else:
-            sent = await bot.send_message(
+            sent = await tg_retry(
+            bot.send_message,
                 chat_id=chat_id,
                 text=data.get("text", ""),
                 parse_mode=ParseMode.HTML
@@ -1379,7 +1725,8 @@ async def cb_send_poll_confirm(callback: CallbackQuery, state: FSMContext, bot: 
     chat_id = config.get("chat_id")
 
     try:
-        await bot.send_poll(
+        await tg_retry(
+            bot.send_poll,
             chat_id=chat_id,
             question=data["question"],
             options=data["options"],
@@ -1419,7 +1766,7 @@ async def cb_admin_call_now(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "confirm_call_now")
 async def cb_confirm_call_now(callback: CallbackQuery, bot: Bot):
-    reminder_info = {"time": "СЕЙЧАС", "label": "внеплановый срочный обход"}
+    reminder_info = {"label": "внеплановый срочный обход", "kind": "emergency"}
     await send_reminder(bot, reminder_info)
     await callback.message.edit_text(
         "✅ <b>Внеплановое оповещение успешно отправлено в группу!</b>",
@@ -1564,6 +1911,12 @@ async def register_bot_commands(bot: Bot):
 async def main():
     ensure_config_exists()
     logger.info(f"Папка данных: {DATA_DIR}")
+    if not acquire_single_instance_lock():
+        logger.error(
+            "Бот уже запущен (возможно, из автозагрузки). Вторая копия не стартует, "
+            "иначе напоминания и отчёты приходили бы дважды."
+        )
+        return
     config = load_config()
     if not config.get("admin_ids"):
         logger.warning(
@@ -1585,11 +1938,14 @@ async def main():
     await register_bot_commands(bot)
 
     global scheduler_instance
-    scheduler = AsyncIOScheduler(timezone=tz)
+    # misfire_grace_time: если запуск задержался (сон ПК, нагрузка), задача всё равно
+    # выполнится в течение 5 минут, а не пропадёт молча (по умолчанию допуск 1 с)
+    scheduler = AsyncIOScheduler(timezone=tz, job_defaults={"misfire_grace_time": 300, "coalesce": True})
     scheduler_instance = scheduler
     setup_jobs(scheduler, bot)
     restore_pending_escalations(scheduler, bot)
     scheduler.start()
+    restore_pending_deletes(bot)
 
     logger.info("Бот успешно запущен и ожидает сообщений...")
     try:
