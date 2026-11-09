@@ -510,7 +510,15 @@ async def cb_already_done(callback: CallbackQuery):
 # ОТЧЁТНОСТЬ
 # ==============================================================================
 
-def generate_report_text(date_str: str) -> str:
+def get_report_times(config: dict) -> list[str]:
+    """Время автоотчётов: daily_report_times (список) или старое daily_report_time."""
+    times = config.get("daily_report_times")
+    if not times:
+        times = [config.get("daily_report_time", "18:45")]
+    return sorted(t for t in times if isinstance(t, str) and ":" in t)
+
+
+def generate_report_text(date_str: str, title: str = "ОТЧЁТ ЗА СМЕНУ") -> str:
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
     tz = pytz.timezone(tz_name)
@@ -547,7 +555,7 @@ def generate_report_text(date_str: str) -> str:
     details = "\n".join(lines) if lines else "<i>Обходы за сегодня ещё не проводились.</i>"
 
     return (
-        "📊 <b>ИТОГОВЫЙ ОТЧЁТ ЗА СМЕНУ</b>\n"
+        f"📊 <b>{title}</b>\n"
         f"📅 <b>Дата:</b> <code>{date_str}</code>\n"
         f"🕒 <b>Время выгрузки:</b> <code>{now.strftime('%H:%M:%S')}</code> ({h(tz_name)})\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -564,12 +572,13 @@ def generate_report_text(date_str: str) -> str:
     )
 
 
-async def send_daily_report(bot: Bot):
+async def send_daily_report(bot: Bot, is_final: bool = True):
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
     tz = pytz.timezone(tz_name)
     date_str = get_today_str(tz)
-    report_text = generate_report_text(date_str)
+    title = "ИТОГОВЫЙ ОТЧЁТ ЗА СМЕНУ" if is_final else "ПРОМЕЖУТОЧНЫЙ ОТЧЁТ (ОБЕД)"
+    report_text = generate_report_text(date_str, title)
 
     chat_id = config.get("chat_id")
     admin_ids = config.get("admin_ids", [])
@@ -804,7 +813,7 @@ async def cb_admin_status(callback: CallbackQuery):
         f"⏰ <b>Обходов:</b> {active} активных (из {len(reminders)})\n"
         f"⏱ <b>Таймаут тревоги:</b> {config.get('escalation_minutes', 15)} мин\n"
         f"🔔 <b>Напоминание заранее:</b> за {config.get('advance_minutes', 0)} мин\n"
-        f"📋 <b>Ежедневный отчёт:</b> в {config.get('daily_report_time', '18:45')}\n"
+        f"📋 <b>Отчёты:</b> в {', '.join(get_report_times(config))}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     b = InlineKeyboardBuilder()
@@ -1473,7 +1482,7 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
     # Пересоздаём только расписание и отчёт; задачи escalation_* (идущие
     # 15-минутные проверки) не трогаем, иначе тревоги терялись бы
     for job in scheduler.get_jobs():
-        if job.id.startswith("rem_job_") or job.id == "daily_report_job":
+        if job.id.startswith(("rem_job_", "daily_report_job")):
             scheduler.remove_job(job.id)
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
@@ -1509,19 +1518,21 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
         except Exception as e:
             logger.error(f"Ошибка планирования {r}: {e}")
 
-    report_time = config.get("daily_report_time", "18:45")
-    try:
-        rh, rm = map(int, report_time.split(":"))
-        scheduler.add_job(
-            send_daily_report,
-            trigger=CronTrigger(day_of_week=days, hour=rh, minute=rm, timezone=tz),
-            args=[bot],
-            name="DailyReport",
-            id="daily_report_job",
-            replace_existing=True
-        )
-    except Exception as e:
-        logger.error(f"Ошибка планирования отчета: {e}")
+    report_times = get_report_times(config)
+    for i, report_time in enumerate(report_times):
+        is_final = i == len(report_times) - 1
+        try:
+            rh, rm = map(int, report_time.split(":"))
+            scheduler.add_job(
+                send_daily_report,
+                trigger=CronTrigger(day_of_week=days, hour=rh, minute=rm, timezone=tz),
+                args=[bot, is_final],
+                name=f"DailyReport_{report_time}",
+                id=f"daily_report_job_{report_time}",
+                replace_existing=True
+            )
+        except Exception as e:
+            logger.error(f"Ошибка планирования отчета {report_time}: {e}")
 
     logger.info(f"Запланировано активных обходов: {count} из {len(reminders)}")
 
