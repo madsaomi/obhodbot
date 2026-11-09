@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    container_name: obhod-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DATA_DIR=/data
+    volumes:
+      # config.json, bot_data.json и bot.log лежат на сервере в папке ./data
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"

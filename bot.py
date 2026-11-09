@@ -25,7 +25,9 @@ if sys.platform == "win32":
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramMigrateToChat, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+)
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -36,6 +38,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    KeyboardButtonRequestUsers,
     CallbackQuery,
     Message,
     BotCommand,
@@ -237,8 +240,30 @@ def format_days(days: str) -> str:
 
 
 def is_admin(user_id: int) -> bool:
-    """Админы задаются только вручную в admin_ids (config.json)."""
+    """Админы задаются вручную в config.json: admin_ids (Telegram ID) или admin_usernames."""
     return user_id in load_config().get("admin_ids", [])
+
+
+async def admin_username_claim(handler, event, data: dict):
+    """Админ, заданный по @username, при первом сообщении боту закрепляется по Telegram ID.
+
+    Дальше права проверяются по ID: если он сменит username или ник займёт кто-то другой,
+    права останутся у того же человека.
+    """
+    user = data.get("event_from_user")
+    if user and user.username:
+        config = load_config()
+        pending = config.get("admin_usernames", [])
+        name = user.username.lower()
+        if any(p.lstrip("@").lower() == name for p in pending):
+            admin_ids = config.get("admin_ids", [])
+            if user.id not in admin_ids:
+                admin_ids.append(user.id)
+            config["admin_ids"] = admin_ids
+            config["admin_usernames"] = [p for p in pending if p.lstrip("@").lower() != name]
+            save_config(config)
+            logger.info(f"@{user.username} получил права администратора (ID {user.id})")
+    return await handler(event, data)
 
 
 # Кнопки, доступные всем сотрудникам; все остальные callback'и — только админам
@@ -354,7 +379,7 @@ async def deny_if_not_allowed(message: Message) -> bool:
 
 async def group_reply(message: Message, text: str, **kwargs) -> Message:
     """reply(), который в группе потом сам убирает и команду, и ответ."""
-    sent = await message.reply(text, **kwargs)
+    sent = await tg_retry(message.reply, text, **kwargs)
     schedule_group_cleanup(message, sent)
     return sent
 
@@ -382,6 +407,7 @@ class AddMentionState(StatesGroup):
 
 # Глобальные объекты
 dp = Dispatcher(storage=MemoryStorage())
+dp.update.outer_middleware(admin_username_claim)
 dp.callback_query.outer_middleware(admin_callback_guard)
 scheduler_instance: AsyncIOScheduler = None
 
@@ -436,16 +462,30 @@ def get_admin_inline_menu() -> InlineKeyboardMarkup:
 
 def get_schedule_keyboard() -> InlineKeyboardMarkup:
     config = load_config()
-    reminders = config.get("reminders", [])
+    reminders = sorted(config.get("reminders", []), key=lambda r: r.get("time", ""))
+    date_str = today_str(config)
     b = InlineKeyboardBuilder()
 
-    # В кнопках — время обхода, а не номер в списке: старая клавиатура
-    # не сработает на другой обход после добавления/удаления
-    for r in reminders:
-        icon = "✅ ВКЛ" if r.get("enabled", True) else "❌ ВЫКЛ"
-        b.button(text=f"{r.get('time')}  {icon}", callback_data=f"toggle_rem_{r.get('time')}")
+    # Обходы сгруппированы по сменам; заголовок смены открывает назначение дежурных на сегодня.
+    # В кнопках — время обхода, а не номер в списке: старая клавиатура не сработает на другой обход
+    for shift in SHIFTS:
+        people = get_shift_duty(config, date_str, shift)[0]
+        b.row(InlineKeyboardButton(
+            text=f"{SHIFT_TITLES[shift]} · сегодня {len(people)} чел. ✏️",
+            callback_data=f"dsh:d:{shift}"
+        ))
+        row = []
+        for r in reminders:
+            if shift_of_time(config, r.get("time", "")) != shift:
+                continue
+            icon = "✅ ВКЛ" if r.get("enabled", True) else "❌ ВЫКЛ"
+            row.append(InlineKeyboardButton(text=f"{r.get('time')}  {icon}", callback_data=f"toggle_rem_{r.get('time')}"))
+            if len(row) == 2:
+                b.row(*row)
+                row = []
+        if row:
+            b.row(*row)
 
-    b.adjust(2)
     b.row(
         InlineKeyboardButton(text="➕ Добавить время", callback_data="add_reminder"),
         InlineKeyboardButton(text="🗑 Удалить время", callback_data="del_reminder_menu")
@@ -468,34 +508,200 @@ def get_mentions_keyboard() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def get_duty_keyboard() -> InlineKeyboardMarkup:
+# ==============================================================================
+# СМЕНЫ: УТРО / ПОСЛЕ ОБЕДА
+# ==============================================================================
+# Недельный график хранится в config.json:
+#   "weekly_duty": {"mon": {"morning": [...], "afternoon": [...]}, ...}
+# Замена на конкретный день — в bot_data.json:
+#   data[дата]["duty_override"] = {"morning": [...]}   (смена без замены берётся из графика)
+
+SHIFTS = ("morning", "afternoon")
+SHIFT_TITLES = {"morning": "🌅 Утро", "afternoon": "🌇 После обеда"}
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+WEEKDAY_FULL = {"mon": "Понедельник", "tue": "Вторник", "wed": "Среда", "thu": "Четверг",
+                "fri": "Пятница", "sat": "Суббота", "sun": "Воскресенье"}
+
+
+def shift_split_minutes(config: dict) -> int:
+    """Граница смен (по умолчанию 13:30): обходы раньше — утро, позже — после обеда."""
+    try:
+        hh, mm = map(int, str(config.get("shift_split", "13:30")).split(":"))
+        return hh * 60 + mm
+    except ValueError:
+        return 13 * 60 + 30
+
+
+def shift_of_time(config: dict, time_str: str, now: datetime | None = None) -> str:
+    try:
+        hh, mm = map(int, time_str.split(":"))
+        minutes = hh * 60 + mm
+    except (ValueError, AttributeError):
+        # «ТЕСТ», «срочно 10:05» и т.п. — по текущему времени
+        now = now or datetime.now(pytz.timezone(config.get("timezone", "Asia/Tashkent")))
+        minutes = now.hour * 60 + now.minute
+    return "morning" if minutes < shift_split_minutes(config) else "afternoon"
+
+
+def current_shift(config: dict) -> str:
+    now = datetime.now(pytz.timezone(config.get("timezone", "Asia/Tashkent")))
+    return shift_of_time(config, now.strftime("%H:%M"))
+
+
+def weekday_of(date_str: str) -> str:
+    return WEEKDAYS[datetime.strptime(date_str, "%Y-%m-%d").weekday()]
+
+
+def working_weekdays(config: dict) -> list[str]:
+    """Рабочие дни из настройки days (например, mon-sat) в порядке недели."""
+    tz = pytz.timezone(config.get("timezone", "Asia/Tashkent"))
+    monday = tz.localize(datetime(2024, 1, 1, 12))  # 1 января 2024 — понедельник
+    result = [wd for i, wd in enumerate(WEEKDAYS) if is_working_day(config, monday + timedelta(days=i))]
+    return result or list(WEEKDAYS)
+
+
+def get_template_duty(config: dict, weekday: str, shift: str) -> list:
+    return list(config.get("weekly_duty", {}).get(weekday, {}).get(shift, []))
+
+
+def get_shift_duty(config: dict, date_str: str, shift: str, data: dict | None = None) -> tuple[list, str]:
+    """Дежурные смены на дату и откуда они: override (замена) / template (график) / legacy."""
+    data = data if data is not None else load_data()
+    day = data.get(date_str, {})
+    override = day.get("duty_override", {})
+    if shift in override:
+        return list(override[shift]), "override"
+    # Старый формат: один общий список дежурных на день
+    if "duty_override" not in day and day.get("duty_users"):
+        return list(day["duty_users"]), "legacy"
+    return get_template_duty(config, weekday_of(date_str), shift), "template"
+
+
+def set_shift_override(date_str: str, shift: str, entries: list):
+    data = load_data()
+    day = data.setdefault(date_str, {"duty_users": [], "rounds": {}})
+    if "duty_override" not in day and day.get("duty_users"):
+        # Переносим старый общий список в обе смены, чтобы ничего не потерять
+        day["duty_override"] = {s: [normalize_staff(e) for e in day["duty_users"]] for s in SHIFTS}
+    day.setdefault("duty_override", {})[shift] = [normalize_staff(e) for e in entries]
+    day["duty_users"] = []
+    save_data(data)
+
+
+def clear_day_overrides(date_str: str):
+    data = load_data()
+    day = data.setdefault(date_str, {"duty_users": [], "rounds": {}})
+    day.pop("duty_override", None)
+    day["duty_users"] = []
+    save_data(data)
+
+
+def set_template_duty(weekday: str, shift: str, entries: list):
     config = load_config()
-    tz_name = config.get("timezone", "Asia/Tashkent")
-    tz = pytz.timezone(tz_name)
-    _, day_data = get_today_data(tz)
-    duty_users = set(day_data.get("duty_users", []))
-    all_staff = config.get("mentions", [])
-
-    b = InlineKeyboardBuilder()
-    for staff in all_staff:
-        status = "✅ НА СМЕНЕ" if staff in duty_users else "❌ ВЫХОДНОЙ"
-        b.button(text=f"{staff}: {status}", callback_data=f"toggle_duty_{staff_key(staff)}")
-
-    b.adjust(1)
-    b.row(
-        InlineKeyboardButton(text="🔄 Сбросить выбор (все дежурят)", callback_data="reset_duty"),
-        InlineKeyboardButton(text="◀️ Назад в меню", callback_data="admin_main")
-    )
-    return b.as_markup()
+    weekly = config.setdefault("weekly_duty", {})
+    weekly.setdefault(weekday, {})[shift] = [normalize_staff(e) for e in entries]
+    save_config(config)
 
 
-def staff_key(name: str) -> str:
+def toggle_person(entries: list, person) -> tuple[list, bool]:
+    """Добавляет/убирает человека. Возвращает (новый список, теперь он в списке?)."""
+    entries = list(entries)
+    existing = find_same_person(entries, person)
+    if existing is not None:
+        entries.remove(existing)
+        return entries, False
+    entries.append(normalize_staff(person))
+    return entries, True
+
+
+def duty_names(entries: list) -> str:
+    return ", ".join(staff_label(p) for p in entries)
+
+
+def duty_summary_html(config: dict, date_str: str, data: dict | None = None) -> str:
+    """Блок «кто дежурит» по сменам с количеством людей — для /duty, статуса, отчёта, админки."""
+    data = data if data is not None else load_data()
+    lines, total = [], []
+    for shift in SHIFTS:
+        entries, source = get_shift_duty(config, date_str, shift, data)
+        mark = " <i>(замена)</i>" if source == "override" else ""
+        if entries:
+            lines.append(f"{SHIFT_TITLES[shift]}: {h(duty_names(entries))} — <b>{len(entries)} чел.</b>{mark}")
+        else:
+            lines.append(f"{SHIFT_TITLES[shift]}: <i>не назначены (отмечаются все)</i>{mark}")
+        for p in entries:
+            if find_same_person(total, p) is None:
+                total.append(p)
+    lines.append(f"👥 Всего на смене сегодня: <b>{len(total)} чел.</b>")
+    return "\n".join(lines)
+
+
+# Сотрудник хранится либо строкой "@username" (старый формат), либо словарём
+# {"id": 123, "username": "ivan" или null, "name": "Иван Петров"} — так можно
+# отмечать людей без @username: упоминание по ID работает и без ника.
+
+def normalize_staff(entry) -> dict:
+    if isinstance(entry, dict):
+        return {
+            "id": entry.get("id"),
+            "username": (entry.get("username") or "").lstrip("@") or None,
+            "name": entry.get("name") or (f"@{entry['username']}" if entry.get("username") else "сотрудник"),
+        }
+    text = str(entry).strip()
+    if text.startswith("@"):
+        return {"id": None, "username": text[1:], "name": text}
+    return {"id": None, "username": None, "name": text}
+
+
+def staff_from_user(user) -> dict:
+    return {"id": user.id, "username": user.username, "name": user.full_name}
+
+
+def staff_ident(entry) -> str:
+    s = normalize_staff(entry)
+    if s["id"]:
+        return f"id:{s['id']}"
+    if s["username"]:
+        return f"u:{s['username'].lower()}"
+    return f"n:{s['name']}"
+
+
+def same_person(a, b) -> bool:
+    sa, sb = normalize_staff(a), normalize_staff(b)
+    if sa["id"] and sb["id"]:
+        return sa["id"] == sb["id"]
+    if sa["username"] and sb["username"]:
+        return sa["username"].lower() == sb["username"].lower()
+    return staff_ident(sa) == staff_ident(sb)
+
+
+def staff_label(entry) -> str:
+    """Подпись для кнопок и отчётов (без упоминания)."""
+    s = normalize_staff(entry)
+    return f"@{s['username']}" if s["username"] else s["name"]
+
+
+def staff_mention_html(entry) -> str:
+    """Упоминание, которое присылает уведомление: по нику или, если ника нет, по ID."""
+    s = normalize_staff(entry)
+    if s["username"]:
+        return h(f"@{s['username']}")
+    if s["id"]:
+        return f'<a href="tg://user?id={int(s["id"])}">{h(s["name"])}</a>'
+    return h(s["name"])
+
+
+def staff_key(entry) -> str:
     """Короткий стабильный ключ сотрудника для callback_data (лимит Telegram — 64 байта)."""
-    return hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+    return hashlib.sha1(staff_ident(entry).encode("utf-8")).hexdigest()[:10]
 
 
-def find_staff(mentions: list[str], key: str):
+def find_staff(mentions: list, key: str):
     return next((m for m in mentions if staff_key(m) == key), None)
+
+
+def find_same_person(entries: list, person):
+    return next((e for e in entries if same_person(e, person)), None)
 
 
 def find_reminder(reminders: list[dict], time_str: str):
@@ -512,8 +718,8 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
 # НАПОМИНАНИЯ И КОНТРОЛЬ ОБХОДОВ
 # ==============================================================================
 
-async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label: str, mentions_str: str):
-    """Срабатывает через 15 минут при отсутствии подтверждения"""
+async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label: str, mentions_html: str):
+    """Срабатывает через 15 минут при отсутствии подтверждения. mentions_html — уже готовый HTML."""
     data = load_data()
     day_data = data.get(date_str, {})
     round_info = day_data.get("rounds", {}).get(time_str)
@@ -532,7 +738,7 @@ async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label:
 
     alert_card = (
         f"⚠️ <b>{h(time_str)} — Обход не подтверждён!</b> ({h(label)})\n"
-        f"👥 Дежурные: {h(mentions_str)}\n"
+        f"👥 Дежурные: {mentions_html}\n"
         f"<i>Прошло {timeout} минут, никто не подтвердил выход на обход.</i>"
     )
 
@@ -571,7 +777,7 @@ async def check_unconfirmed_round(bot: Bot, date_str: str, time_str: str, label:
     admin_card = (
         f"🚨 <b>[Тревога руководству]</b>{' (тест)' if is_test else ''}\n"
         f"Обход в <b>{h(time_str)}</b> ({h(label)}) не подтверждён вовремя!\n"
-        f"Дежурные: {h(mentions_str)}"
+        f"Дежурные: {mentions_html}"
     )
     for a_id in admin_ids:
         try:
@@ -592,31 +798,33 @@ async def send_reminder(bot: Bot, reminder_info: dict):
         logger.warning("chat_id не настроен. Напишите /setchat в рабочей группе.")
         return
 
-    duty_users = day_data.get("duty_users", [])
-    if duty_users:
-        mentions_str = " ".join(duty_users)
-    else:
-        all_mentions = config.get("mentions", [])
-        mentions_str = " ".join(all_mentions) if all_mentions else "Все сотрудники"
-
     kind = reminder_info.get("kind", "scheduled")
     if kind == "emergency":
         # У каждого срочного вызова свой ключ, чтобы второй вызов не затирал первый
         time_str = f"срочно {now.strftime('%H:%M')}"
     else:
         time_str = reminder_info.get("time", now.strftime("%H:%M"))
+    shift = shift_of_time(config, time_str, now)
+    tagged = get_shift_duty(config, date_str, shift)[0] or config.get("mentions", [])
+    if tagged:
+        # Люди без @username отмечаются ссылкой по ID — уведомление им тоже придёт
+        mentions_html = " ".join(staff_mention_html(p) for p in tagged)
+        mentions_str = " ".join(staff_label(p) for p in tagged)
+    else:
+        mentions_html = mentions_str = "Все сотрудники"
+
     label = reminder_info.get("label", "обход")
 
     advance = int(config.get("advance_minutes", 0))
     if kind == "scheduled" and reminder_info.get("scheduled") and advance > 0:
         reminder_card = (
             f"🔔 <b>Через {advance} мин обход в {h(time_str)}!</b> ({h(label)})\n"
-            f"👥 Дежурные: {h(mentions_str)}"
+            f"👥 Дежурные: {mentions_html}"
         )
     else:
         reminder_card = (
             f"🔔 <b>{h(time_str)} — Время обхода!</b> ({h(label)})\n"
-            f"👥 Дежурные: {h(mentions_str)}"
+            f"👥 Дежурные: {mentions_html}"
         )
 
     b = InlineKeyboardBuilder()
@@ -637,15 +845,17 @@ async def send_reminder(bot: Bot, reminder_info: dict):
 
         data = load_data()
         if date_str not in data:
-            data[date_str] = {"duty_users": duty_users, "rounds": {}}
+            data[date_str] = {"duty_users": [], "rounds": {}}
         data[date_str]["rounds"][time_str] = {
             "label": label,
             "kind": kind,
+            "shift": shift,
             "status": "pending",
             "chat_id": chat_id,
             "message_id": sent.message_id,
             "sent_at": now.strftime("%H:%M:%S"),
-            "mentions": mentions_str
+            "mentions": mentions_str,
+            "mentions_html": mentions_html
         }
         save_data(data)
 
@@ -659,7 +869,7 @@ async def send_reminder(bot: Bot, reminder_info: dict):
                 check_unconfirmed_round,
                 trigger="date",
                 run_date=escalation_time,
-                args=[bot, date_str, time_str, label, mentions_str],
+                args=[bot, date_str, time_str, label, mentions_html],
                 id=f"escalation_{date_str}_{time_str}",
                 replace_existing=True
             )
@@ -813,9 +1023,7 @@ def generate_report_text(date_str: str, title: str = "ОТЧЁТ ЗА СМЕНУ
     data = load_data()
     day_data = data.get(date_str, {})
     rounds = day_data.get("rounds", {})
-    duty_users = day_data.get("duty_users", [])
-
-    duty_str = h(" ".join(duty_users)) if duty_users else "Все сотрудники (общий график)"
+    duty_block = duty_summary_html(config, date_str, data)
 
     # В статистику идут только обходы по графику; тесты не считаются вовсе,
     # срочные вызовы показываются отдельным списком
@@ -866,7 +1074,7 @@ def generate_report_text(date_str: str, title: str = "ОТЧЁТ ЗА СМЕНУ
         f"📅 <b>Дата:</b> <code>{date_str}</code>\n"
         f"🕒 <b>Время выгрузки:</b> <code>{now.strftime('%H:%M:%S')}</code> ({h(tz_name)})\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👮‍♂️ <b>Дежурные:</b> {duty_str}\n\n"
+        f"👮‍♂️ <b>Дежурные:</b>\n{duty_block}\n\n"
         "📈 <b>Результаты:</b>\n"
         f"• Всего обходов: <b>{total}</b>\n"
         f"• Выполнено вовремя:  <b>{on_time}</b> ({percent}%) 🟢\n"
@@ -974,31 +1182,8 @@ async def cmd_report_open(message: Message):
 async def cmd_duty_open(message: Message):
     if await deny_if_not_allowed(message):
         return
-    config = load_config()
-    tz_name = config.get("timezone", "Asia/Tashkent")
-    tz = pytz.timezone(tz_name)
-    _, day_data = get_today_data(tz)
-    duty_users = day_data.get("duty_users", [])
-
-    if duty_users:
-        duty_text = f"🟢 <b>На смене сейчас:</b> {h(' '.join(duty_users))}"
-    else:
-        duty_text = "⚪️ <i>Дежурные на сегодня ещё не выбраны (уведомления приходят всем сотрудникам).</i>"
-
-    b = InlineKeyboardBuilder()
-    b.row(
-        InlineKeyboardButton(text="👮‍♂️ Заступить на смену", callback_data="claim_duty_self"),
-        InlineKeyboardButton(text="🚪 Сдать смену", callback_data="unclaim_duty_self")
-    )
-
-    card = (
-        "📋 <b>График дежурства на сегодня</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{duty_text}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Нажмите кнопку ниже, чтобы заступить или сдать смену:</i>"
-    )
-    await group_reply(message, card, reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
+    text, markup = render_duty_card(load_config())
+    await group_reply(message, text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
 @dp.message(F.text == "🔔 Тестовый обход")
@@ -1013,7 +1198,7 @@ async def cmd_test_open(message: Message, bot: Bot):
 
 
 @dp.message(Command("setchat"))
-async def cmd_setchat(message: Message):
+async def cmd_setchat(message: Message, bot: Bot):
     if not message.from_user or not is_admin(message.from_user.id):
         await group_reply(message, "⛔️ Привязать группу может только администратор бота.")
         return
@@ -1024,16 +1209,51 @@ async def cmd_setchat(message: Message):
     config["chat_id"] = message.chat.id
     save_config(config)
 
+    logger.info(f"Группа привязана: {message.chat.id} ({message.chat.title})")
+
     chat_name = h(message.chat.title) if message.chat.title else "текущая группа"
-    await group_reply(
-        message,
-        "🎉 <b>Группа успешно привязана к боту!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷 <b>Чат:</b> {chat_name}\n"
-        f"🆔 <b>ID:</b> <code>{message.chat.id}</code>\n\n"
-        "Все уведомления об обходах, тревоги и отчеты теперь будут направляться сюда.",
-        parse_mode=ParseMode.HTML
-    )
+    try:
+        await group_reply(
+            message,
+            "🎉 <b>Группа успешно привязана к боту!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷 <b>Чат:</b> {chat_name}\n"
+            f"🆔 <b>ID:</b> <code>{message.chat.id}</code>\n\n"
+            "Все уведомления об обходах, тревоги и отчеты теперь будут направляться сюда.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        # Привязка уже сохранена — даже если ответ не дошёл, проверку админу всё равно шлём
+        logger.warning(f"Не удалось ответить на /setchat в группе: {e}")
+
+    # Сразу проверяем права бота в группе и пишем итог админу в личку
+    _, lines = await check_setup(bot)
+    try:
+        await tg_retry(bot.send_message, chat_id=message.from_user.id,
+                       text="🩺 <b>Проверка после привязки группы</b>\n\n" + "\n".join(h(line) for line in lines),
+                       parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Не удалось отправить итог проверки админу: {e}")
+
+
+@dp.message(F.migrate_to_chat_id)
+async def on_group_migrated(message: Message, bot: Bot):
+    """Обычная группа стала супергруппой (например, боту дали права админа) — у неё новый ID."""
+    config = load_config()
+    if config.get("chat_id") != message.chat.id:
+        return
+    new_id = message.migrate_to_chat_id
+    config["chat_id"] = new_id
+    save_config(config)
+    logger.warning(f"Группа {message.chat.id} стала супергруппой, привязка перенесена на {new_id}")
+    for a_id in config.get("admin_ids", []):
+        try:
+            await tg_retry(bot.send_message, chat_id=a_id,
+                           text=f"ℹ️ Рабочая группа стала супергруппой, привязка автоматически перенесена "
+                                f"на новый ID <code>{new_id}</code>. Ничего делать не нужно.",
+                           parse_mode=ParseMode.HTML, disable_notification=True)
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить админа {a_id} о смене ID группы: {e}")
 
 
 @dp.message(Command("status"))
@@ -1048,8 +1268,8 @@ async def cmd_status(message: Message):
 
     chat_id = config.get("chat_id")
     chat_info = f"<code>{chat_id}</code>" if chat_id else "⚠️ <i>Не привязана (напишите /setchat в группе)</i>"
-    mentions = h(" ".join(config.get("mentions", []))) if config.get("mentions") else "—"
-    duty_users = h(" ".join(day_data.get("duty_users", []))) or "Все по общему списку"
+    mentions = h(", ".join(staff_label(p) for p in config.get("mentions", []))) or "—"
+    duty_block = duty_summary_html(config, today_str(config))
 
     reminders = config.get("reminders", [])
     active_count = sum(1 for r in reminders if r.get("enabled", True))
@@ -1059,7 +1279,7 @@ async def cmd_status(message: Message):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕒 <b>Текущее время:</b> <code>{now.strftime('%d.%m.%Y %H:%M:%S')}</code> ({h(tz_name)})\n"
         f"📍 <b>Привязанный чат:</b> {chat_info}\n"
-        f"👮‍♂️ <b>Дежурные сегодня:</b> {duty_users}\n"
+        f"👮‍♂️ <b>Дежурные сегодня:</b>\n{duty_block}\n"
         f"👥 <b>Штат сотрудников:</b> {mentions}\n"
         f"⏰ <b>Активных обходов:</b> {active_count} из {len(reminders)}\n"
         f"⏱ <b>Время на реакцию:</b> {config.get('escalation_minutes', 15)} мин\n"
@@ -1088,7 +1308,11 @@ async def cb_admin_main(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_cancel")
 async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
+    was_picking = await state.get_state() == AddMentionState.waiting_for_username.state
     await state.clear()
+    if was_picking:
+        # Убираем кнопку выбора контактов и возвращаем обычное нижнее меню
+        await callback.message.answer("Добавление отменено.", reply_markup=get_admin_bottom_keyboard())
     await callback.message.edit_text(
         "❌ <b>Действие отменено.</b>\n\n🎛 <b>Панель управления:</b>",
         reply_markup=get_admin_inline_menu(),
@@ -1122,7 +1346,7 @@ async def cb_admin_status(callback: CallbackQuery):
     admins = config.get("admin_ids", [])
     reminders = config.get("reminders", [])
     active = sum(1 for r in reminders if r.get("enabled", True))
-    mentions = h(" ".join(config.get("mentions", []))) or "не указаны"
+    mentions = h(", ".join(staff_label(p) for p in config.get("mentions", []))) or "не указаны"
 
     card = (
         "ℹ️ <b>СОСТОЯНИЕ СИСТЕМЫ</b>\n"
@@ -1148,114 +1372,238 @@ async def cb_admin_status(callback: CallbackQuery):
 # ДЕЖУРСТВА И СМЕНЫ
 # ==============================================================================
 
+def today_str(config: dict) -> str:
+    return datetime.now(pytz.timezone(config.get("timezone", "Asia/Tashkent"))).strftime("%Y-%m-%d")
+
+
+def short_date(date_str: str) -> str:
+    return f"{date_str[8:10]}.{date_str[5:7]}"
+
+
+def render_duty_today(config: dict):
+    date_str = today_str(config)
+    wd = weekday_of(date_str)
+    text = (
+        "👮‍♂️ <b>Дежурные на сегодня</b>\n"
+        f"📅 {WEEKDAY_FULL[wd]}, {short_date(date_str)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{duty_summary_html(config, date_str)}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Изменения здесь — замена только на сегодня. "
+        "Постоянное расписание — «📅 График на неделю».</i>"
+    )
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="🌅 Изменить утро", callback_data="dsh:d:morning"),
+        InlineKeyboardButton(text="🌇 Изменить после обеда", callback_data="dsh:d:afternoon")
+    )
+    b.row(InlineKeyboardButton(text="📅 График на неделю", callback_data="dweek"))
+    b.row(InlineKeyboardButton(text="↩️ Вернуть сегодня по графику", callback_data="dreset"))
+    b.row(InlineKeyboardButton(text="◀️ Назад в меню", callback_data="admin_main"))
+    return text, b.as_markup()
+
+
+def shift_entries(config: dict, scope: str, shift: str) -> list:
+    if scope == "d":
+        return get_shift_duty(config, today_str(config), shift)[0]
+    return get_template_duty(config, scope, shift)
+
+
+def render_shift_editor(config: dict, scope: str, shift: str):
+    entries = shift_entries(config, scope, shift)
+    if scope == "d":
+        where = f"сегодня, {short_date(today_str(config))} (замена только на этот день)"
+        back = "admin_duty_menu"
+    else:
+        where = f"{WEEKDAY_FULL[scope]} (каждую неделю)"
+        back = f"dday:{scope}"
+    staff = config.get("mentions", [])
+    current = h(duty_names(entries)) if entries else "никто — будут отмечены все сотрудники"
+    text = (
+        f"{SHIFT_TITLES[shift]} · <b>{where}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Нажмите на сотрудника, чтобы поставить ✅ или снять со смены.\n\n"
+        f"Сейчас: {current} — <b>{len(entries)} чел.</b>"
+    )
+    b = InlineKeyboardBuilder()
+    shown = []
+    for person in list(staff) + [e for e in entries if find_same_person(staff, e) is None]:
+        if find_same_person(shown, person) is not None:
+            continue
+        shown.append(person)
+        on = find_same_person(entries, person) is not None
+        b.button(text=f"{'✅' if on else '▫️'} {staff_label(person)}",
+                 callback_data=f"dtg:{scope}:{shift}:{staff_key(person)}")
+    b.adjust(2)
+    if not staff:
+        text += "\n\n⚠️ Список сотрудников пуст — сначала добавьте их в «👥 Сотрудники»."
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back))
+    return text, b.as_markup()
+
+
+def render_week(config: dict):
+    lines = []
+    b = InlineKeyboardBuilder()
+    for wd in working_weekdays(config):
+        m = get_template_duty(config, wd, "morning")
+        a = get_template_duty(config, wd, "afternoon")
+        lines.append(
+            f"<b>{DAY_NAMES[wd]}</b>: 🌅 {h(duty_names(m)) or '—'} ({len(m)}) · "
+            f"🌇 {h(duty_names(a)) or '—'} ({len(a)})"
+        )
+        b.button(text=f"{DAY_NAMES[wd]} · 🌅 {len(m)} · 🌇 {len(a)}", callback_data=f"dday:{wd}")
+    b.adjust(2)
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin_duty_menu"))
+    text = (
+        "📅 <b>График дежурств на неделю</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) + "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Повторяется каждую неделю. Выберите день, чтобы назначить людей. "
+        "Если на смену никто не назначен, бот отмечает всех сотрудников.</i>"
+    )
+    return text, b.as_markup()
+
+
+def render_day(config: dict, wd: str):
+    m = get_template_duty(config, wd, "morning")
+    a = get_template_duty(config, wd, "afternoon")
+    text = (
+        f"📅 <b>{WEEKDAY_FULL[wd]}</b> — каждую неделю\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌅 Утро: {h(duty_names(m)) or '—'} — <b>{len(m)} чел.</b>\n"
+        f"🌇 После обеда: {h(duty_names(a)) or '—'} — <b>{len(a)} чел.</b>"
+    )
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="🌅 Утро", callback_data=f"dsh:{wd}:morning"),
+        InlineKeyboardButton(text="🌇 После обеда", callback_data=f"dsh:{wd}:afternoon")
+    )
+    b.row(InlineKeyboardButton(text="◀️ К неделе", callback_data="dweek"))
+    return text, b.as_markup()
+
+
+async def show(callback: CallbackQuery, text: str, markup):
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            raise
+
+
 @dp.callback_query(F.data == "admin_duty_menu")
 async def cb_admin_duty_menu(callback: CallbackQuery):
-    card = (
-        "👮‍♂️ <b>Управление дежурными на смене</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Нажмите на сотрудника, чтобы переключить статус:\n\n"
-        "• <b>✅ НА СМЕНЕ</b> — бот будет вызывать его на обход\n"
-        "• <b>❌ ВЫХОДНОЙ</b> — бот не будет его беспокоить\n\n"
-        "<i>Если дежурный не выбран, уведомления получают все.</i>"
-    )
-    await callback.message.edit_text(card, reply_markup=get_duty_keyboard(), parse_mode=ParseMode.HTML)
+    await show(callback, *render_duty_today(load_config()))
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("toggle_duty_"))
-async def cb_toggle_duty(callback: CallbackQuery):
-    key = callback.data[len("toggle_duty_"):]
+@dp.callback_query(F.data == "dweek")
+async def cb_duty_week(callback: CallbackQuery):
+    await show(callback, *render_week(load_config()))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dday:"))
+async def cb_duty_day(callback: CallbackQuery):
+    wd = callback.data.split(":", 1)[1]
+    if wd not in WEEKDAYS:
+        await callback.answer("Неизвестный день", show_alert=True)
+        return
+    await show(callback, *render_day(load_config(), wd))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dsh:"))
+async def cb_duty_shift(callback: CallbackQuery):
+    _, scope, shift = callback.data.split(":", 2)
+    if shift not in SHIFTS or (scope != "d" and scope not in WEEKDAYS):
+        await callback.answer("Ошибка данных кнопки", show_alert=True)
+        return
+    await show(callback, *render_shift_editor(load_config(), scope, shift))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dtg:"))
+async def cb_duty_toggle(callback: CallbackQuery):
+    try:
+        _, scope, shift, key = callback.data.split(":", 3)
+    except ValueError:
+        await callback.answer("Ошибка данных кнопки", show_alert=True)
+        return
+    if shift not in SHIFTS or (scope != "d" and scope not in WEEKDAYS):
+        await callback.answer("Ошибка данных кнопки", show_alert=True)
+        return
     config = load_config()
-    all_staff = config.get("mentions", [])
-    target = find_staff(all_staff, key)
-
-    if target:
-        tz_name = config.get("timezone", "Asia/Tashkent")
-        tz = pytz.timezone(tz_name)
-        date_str, day_data = get_today_data(tz)
-        duty_users = day_data.get("duty_users", [])
-
-        data = load_data()
-        if target in duty_users:
-            duty_users.remove(target)
-            msg = f"{target}: ❌ ВЫХОДНОЙ"
-        else:
-            duty_users.append(target)
-            msg = f"{target}: ✅ НА СМЕНЕ"
-
-        data[date_str]["duty_users"] = duty_users
-        save_data(data)
-
-        await callback.message.edit_reply_markup(reply_markup=get_duty_keyboard())
-        await callback.answer(msg)
-    else:
-        await callback.message.edit_reply_markup(reply_markup=get_duty_keyboard())
+    entries = shift_entries(config, scope, shift)
+    person = find_staff(config.get("mentions", []), key) or find_staff(entries, key)
+    if person is None:
+        await show(callback, *render_shift_editor(config, scope, shift))
         await callback.answer("Этого сотрудника уже нет в списке — список обновлён.", show_alert=True)
-
-
-@dp.callback_query(F.data == "reset_duty")
-async def cb_reset_duty(callback: CallbackQuery):
-    config = load_config()
-    tz_name = config.get("timezone", "Asia/Tashkent")
-    tz = pytz.timezone(tz_name)
-    date_str, _ = get_today_data(tz)
-
-    data = load_data()
-    data[date_str]["duty_users"] = []
-    save_data(data)
-
-    await callback.message.edit_reply_markup(reply_markup=get_duty_keyboard())
-    await callback.answer("Дежурные сброшены: уведомления получают все")
-
-
-@dp.callback_query(F.data.in_(["claim_duty_self", "unclaim_duty_self"]))
-async def cb_claim_duty_self(callback: CallbackQuery):
-    config = load_config()
-    tz_name = config.get("timezone", "Asia/Tashkent")
-    tz = pytz.timezone(tz_name)
-    date_str, day_data = get_today_data(tz)
-    duty_users = day_data.get("duty_users", [])
-
-    user = callback.from_user
-    username_str = f"@{user.username}" if user.username else user.full_name
-
-    data = load_data()
-    if callback.data == "claim_duty_self":
-        if username_str not in duty_users:
-            duty_users.append(username_str)
-            data[date_str]["duty_users"] = duty_users
-            save_data(data)
-            # Текст всплывашки ограничен 200 символами, поэтому подсказка короткая
-            no_username_hint = (
-                "\n\n⚠️ Нет @username — бот не сможет вас отметить. Задайте его в настройках Telegram."
-            ) if not user.username else ""
-            await callback.answer(f"✅ Вы на смене: {username_str[:40]}{no_username_hint}", show_alert=True)
-        else:
-            await callback.answer("Вы уже находитесь на смене!", show_alert=False)
+        return
+    entries, now_on = toggle_person(entries, person)
+    if scope == "d":
+        set_shift_override(today_str(config), shift, entries)
     else:
-        if username_str in duty_users:
-            duty_users.remove(username_str)
-            data[date_str]["duty_users"] = duty_users
-            save_data(data)
-            await callback.answer(f"🚪 Вы сдали смену: {username_str}", show_alert=True)
-        else:
-            await callback.answer("Вас не было в списке дежурных.", show_alert=False)
+        set_template_duty(scope, shift, entries)
+    await show(callback, *render_shift_editor(load_config(), scope, shift))
+    await callback.answer(f"{staff_label(person)[:40]}: {'✅ на смене' if now_on else 'снят со смены'} · всего {len(entries)} чел.")
 
-    cur_text = h(" ".join(duty_users)) if duty_users else "не назначены"
-    card = (
-        "📋 <b>График дежурства на сегодня</b>\n"
+
+@dp.callback_query(F.data == "dreset")
+async def cb_duty_reset(callback: CallbackQuery):
+    config = load_config()
+    clear_day_overrides(today_str(config))
+    await show(callback, *render_duty_today(config))
+    await callback.answer("Замены на сегодня убраны — дежурные по недельному графику")
+
+
+def render_duty_card(config: dict):
+    shift = current_shift(config)
+    text = (
+        "📋 <b>Дежурные на сегодня</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 <b>Сейчас на смене:</b> {cur_text}\n"
+        f"{duty_summary_html(config, today_str(config))}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Нажмите кнопку ниже, чтобы заступить или сдать смену:</i>"
+        f"<i>Кнопки ниже — заступить или сдать текущую смену ({SHIFT_TITLES[shift]}).</i>"
     )
     b = InlineKeyboardBuilder()
     b.row(
         InlineKeyboardButton(text="👮‍♂️ Заступить на смену", callback_data="claim_duty_self"),
         InlineKeyboardButton(text="🚪 Сдать смену", callback_data="unclaim_duty_self")
     )
+    return text, b.as_markup()
+
+
+@dp.callback_query(F.data.in_(["claim_duty_self", "unclaim_duty_self"]))
+async def cb_claim_duty_self(callback: CallbackQuery):
+    config = load_config()
+    date_str = today_str(config)
+    shift = current_shift(config)
+    entries, _ = get_shift_duty(config, date_str, shift)
+
+    me = staff_from_user(callback.from_user)  # с ID — отметка работает и без @username
+    label = staff_label(me)[:40]
+    existing = find_same_person(entries, me)
+    shift_name = SHIFT_TITLES[shift]
+
+    if callback.data == "claim_duty_self":
+        if existing is None:
+            entries.append(me)
+            set_shift_override(date_str, shift, entries)
+            await callback.answer(f"✅ {label}: вы на смене «{shift_name}»", show_alert=True)
+        else:
+            await callback.answer(f"Вы уже на смене «{shift_name}»!", show_alert=False)
+    else:
+        if existing is not None:
+            entries.remove(existing)
+            set_shift_override(date_str, shift, entries)
+            await callback.answer(f"🚪 {label}: вы сдали смену «{shift_name}»", show_alert=True)
+        else:
+            await callback.answer(f"Вас нет в смене «{shift_name}».", show_alert=False)
+
     try:
-        await callback.message.edit_text(card, reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
+        text, markup = render_duty_card(load_config())
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -1271,7 +1619,8 @@ async def cb_admin_schedule(callback: CallbackQuery):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Нажмите на нужное время, чтобы включить или отключить:\n\n"
         "• <b>✅ ВКЛ</b> — обход активен (напоминание придёт)\n"
-        "• <b>❌ ВЫКЛ</b> — обход отключен (напоминание пропустится)"
+        "• <b>❌ ВЫКЛ</b> — обход отключен (напоминание пропустится)\n"
+        "• Нажмите на <b>🌅 Утро</b> или <b>🌇 После обеда</b>, чтобы назначить дежурных на сегодня"
     )
     await callback.message.edit_text(card, reply_markup=get_schedule_keyboard(), parse_mode=ParseMode.HTML)
     await callback.answer()
@@ -1433,53 +1782,124 @@ async def cb_del_reminder_confirm(callback: CallbackQuery, bot: Bot):
 async def cb_admin_mentions(callback: CallbackQuery):
     config = load_config()
     mentions = config.get("mentions", [])
-    mentions_text = "\n".join([f"• <b>{h(m)}</b>" for m in mentions]) if mentions else "<i>Список пока пуст</i>"
+
+    def fmt(m) -> str:
+        s = normalize_staff(m)
+        if s["username"]:
+            return f"• <b>@{h(s['username'])}</b>"
+        return f"• <b>{h(s['name'])}</b> <i>(без ника, отмечается по ID)</i>"
+
+    mentions_text = "\n".join(fmt(m) for m in mentions) if mentions else "<i>Список пока пуст</i>"
 
     card = (
         "👥 <b>Штат ответственных сотрудников</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{mentions_text}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Их никнеймы используются для тегов и назначения смен.</i>"
+        "<i>Их бот отмечает в напоминаниях и показывает при назначении смен.</i>"
     )
     await callback.message.edit_text(card, reply_markup=get_mentions_keyboard(), parse_mode=ParseMode.HTML)
     await callback.answer()
+
+
+PICK_CONTACTS_TEXT = "👤 Выбрать из контактов"
+PICK_CANCEL_TEXT = "❌ Отмена"
+
+
+def get_pick_staff_keyboard() -> ReplyKeyboardMarkup:
+    """Кнопка выбора людей из контактов Telegram: бот получает их ID, даже если нет @username."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(
+                text=PICK_CONTACTS_TEXT,
+                request_users=KeyboardButtonRequestUsers(
+                    request_id=1, user_is_bot=False, max_quantity=10,
+                    request_name=True, request_username=True
+                )
+            )],
+            [KeyboardButton(text=PICK_CANCEL_TEXT)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+
+def add_staff_entries(new_entries: list) -> tuple[list, list]:
+    """Добавляет сотрудников без дублей. Если человек уже был по нику — дописывает ему ID."""
+    config = load_config()
+    current = config.get("mentions", [])
+    added, updated = [], []
+    for entry in new_entries:
+        existing = find_same_person(current, entry)
+        if existing is None:
+            current.append(entry)
+            added.append(entry)
+        elif isinstance(entry, dict) and entry.get("id") and not normalize_staff(existing)["id"]:
+            current[current.index(existing)] = entry
+            updated.append(entry)
+    config["mentions"] = current
+    save_config(config)
+    return added, updated
+
+
+async def finish_add_staff(message: Message, state: FSMContext, added: list, updated: list):
+    await state.clear()
+    parts = []
+    if added:
+        parts.append("✅ Добавлены: " + h(", ".join(staff_label(e) for e in added)))
+    if updated:
+        parts.append("🔄 Обновлены (теперь отмечаются по ID): " + h(", ".join(staff_label(e) for e in updated)))
+    if not parts:
+        parts.append("ℹ️ Эти сотрудники уже есть в списке.")
+    # Возвращаем обычное нижнее меню вместо кнопки выбора контактов
+    await message.answer("\n".join(parts), reply_markup=get_admin_bottom_keyboard(), parse_mode=ParseMode.HTML)
+    await message.answer("🎛 <b>Панель управления:</b>", reply_markup=get_admin_inline_menu(), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data == "add_mention")
 async def cb_add_mention(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddMentionState.waiting_for_username)
     await callback.message.edit_text(
-        "✍️ Отправьте юзернейм сотрудника в Telegram (например, <code>@username</code> или несколько через пробел):",
+        "➕ <b>Добавление сотрудников</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Нажмите кнопку <b>«{PICK_CONTACTS_TEXT}»</b> внизу и отметьте людей (до 10 за раз). "
+        "Так можно добавить и тех, у кого нет @username.\n"
+        "• Или отправьте ники текстом: <code>@ivan @petr</code>",
         reply_markup=get_cancel_keyboard(),
         parse_mode=ParseMode.HTML
     )
+    await callback.message.answer("👇 Выберите сотрудников:", reply_markup=get_pick_staff_keyboard())
     await callback.answer()
+
+
+@dp.message(AddMentionState.waiting_for_username, F.users_shared)
+async def process_add_mention_shared(message: Message, state: FSMContext):
+    new_entries = []
+    for u in message.users_shared.users:
+        name = " ".join(x for x in (u.first_name, u.last_name) if x) or (f"@{u.username}" if u.username else f"ID {u.user_id}")
+        new_entries.append({"id": u.user_id, "username": u.username, "name": name})
+    added, updated = add_staff_entries(new_entries)
+    await finish_add_staff(message, state, added, updated)
+
+
+@dp.message(AddMentionState.waiting_for_username, F.text == PICK_CANCEL_TEXT)
+async def process_add_mention_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Добавление отменено.", reply_markup=get_admin_bottom_keyboard())
+    await message.answer("🎛 <b>Панель управления:</b>", reply_markup=get_admin_inline_menu(), parse_mode=ParseMode.HTML)
 
 
 @dp.message(AddMentionState.waiting_for_username)
 async def process_add_mention(message: Message, state: FSMContext):
     if not message.text or not message.text.split():
-        await message.reply("⚠️ Отправьте юзернейм текстом, например <code>@username</code>:")
+        await message.reply(
+            f"⚠️ Нажмите «{PICK_CONTACTS_TEXT}» внизу или отправьте ник текстом, например <code>@username</code>:"
+        )
         return
-    parts = message.text.split()
-    new_mentions = [p if p.startswith("@") else f"@{p}" for p in parts]
-
-    config = load_config()
-    current = config.get("mentions", [])
-    for m in new_mentions:
-        if m not in current:
-            current.append(m)
-
-    config["mentions"] = current
-    save_config(config)
-
-    await state.clear()
-    await message.answer(
-        f"✅ Добавлены сотрудники:\n{h(' '.join(new_mentions))}",
-        reply_markup=get_admin_inline_menu(),
-        parse_mode=ParseMode.HTML
-    )
+    parts = [p.strip(",;") for p in message.text.split()]
+    new_entries = [p if p.startswith("@") else f"@{p}" for p in parts if p.strip("@")]
+    added, updated = add_staff_entries(new_entries)
+    await finish_add_staff(message, state, added, updated)
 
 
 async def render_del_mention_menu(callback: CallbackQuery):
@@ -1488,7 +1908,7 @@ async def render_del_mention_menu(callback: CallbackQuery):
     b = InlineKeyboardBuilder()
 
     for m in mentions:
-        b.button(text=f"🗑 {m}", callback_data=f"del_mention_{staff_key(m)}")
+        b.button(text=f"🗑 {staff_label(m)}", callback_data=f"del_mention_{staff_key(m)}")
 
     b.adjust(2)
     b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin_mentions"))
@@ -1518,7 +1938,7 @@ async def cb_del_mention(callback: CallbackQuery):
         config["mentions"] = mentions
         save_config(config)
         await render_del_mention_menu(callback)
-        await callback.answer(f"Удален: {target}")
+        await callback.answer(f"Удален: {staff_label(target)[:60]}")
     else:
         await render_del_mention_menu(callback)
         await callback.answer("Этого сотрудника уже нет в списке — список обновлён.", show_alert=True)
@@ -1814,7 +2234,8 @@ def restore_pending_escalations(scheduler: AsyncIOScheduler, bot: Bot):
                 check_unconfirmed_round,
                 trigger="date",
                 run_date=run_date,
-                args=[bot, date_str, time_str, info.get("label", "обход"), info.get("mentions", "")],
+                args=[bot, date_str, time_str, info.get("label", "обход"),
+                      info.get("mentions_html") or h(info.get("mentions", ""))],
                 id=f"escalation_{date_str}_{time_str}",
                 replace_existing=True
             )
@@ -1884,6 +2305,119 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
     logger.info(f"Запланировано активных обходов: {count} из {len(reminders)}")
 
 
+# ==============================================================================
+# САМОПРОВЕРКА НАСТРОЙКИ
+# ==============================================================================
+
+async def check_setup(bot: Bot) -> tuple[bool, list[str]]:
+    """Проверяет, что группа привязана и у бота есть нужные права.
+
+    Возвращает (всё ли в порядке, строки отчёта для лога и сообщения).
+    """
+    config = load_config()
+    chat_id = config.get("chat_id")
+    lines: list[str] = []
+    ok = True
+
+    if not config.get("admin_ids"):
+        ok = False
+        lines.append("❌ Не задан ни один администратор (admin_ids в config.json).")
+    for name in config.get("admin_usernames", []):
+        lines.append(
+            f"ℹ️ @{name.lstrip('@')} станет админом, как только напишет боту /start в личку "
+            "(до этого бот не может присылать ему отчёты и тревоги)."
+        )
+
+    if not chat_id:
+        lines.append(
+            "❌ Рабочая группа не привязана: напоминания и отчёты отправлять некуда.\n"
+            "   → Добавьте бота в группу и напишите там /setchat."
+        )
+        return False, lines
+
+    try:
+        try:
+            chat = await tg_retry(bot.get_chat, chat_id=chat_id)
+        except TelegramMigrateToChat as e:
+            # Группа стала супергруппой, пока бот был выключен — переносим привязку
+            chat_id = e.migrate_to_chat_id
+            config["chat_id"] = chat_id
+            save_config(config)
+            lines.append(f"ℹ️ Группа стала супергруппой, привязка перенесена на новый ID {chat_id}.")
+            chat = await tg_retry(bot.get_chat, chat_id=chat_id)
+        me = await tg_retry(bot.get_me)
+        member = await tg_retry(bot.get_chat_member, chat_id=chat_id, user_id=me.id)
+    except (TelegramNetworkError, TelegramServerError) as e:
+        # Это проблема связи, а не настройки — не пугаем «бот удалён из группы»
+        lines.append(f"⚠️ Нет связи с Telegram, проверить группу не удалось ({e}). Повторите позже: /check.")
+        return False, lines
+    except Exception as e:
+        lines.append(
+            f"❌ Нет доступа к привязанной группе {chat_id}: {e}\n"
+            "   → Бот удалён из группы или группа стала супергруппой (сменился ID). "
+            "Добавьте бота заново и напишите /setchat."
+        )
+        return False, lines
+
+    title = chat.title or str(chat_id)
+    status = getattr(member, "status", "")
+    status = getattr(status, "value", status)
+    if status in ("left", "kicked"):
+        lines.append(f"❌ Бота нет в группе «{title}». → Добавьте его и напишите /setchat.")
+        return False, lines
+
+    lines.append(f"✅ Группа «{title}» привязана, бот состоит в ней.")
+    if status in ("administrator", "creator"):
+        if getattr(member, "can_delete_messages", False) or status == "creator":
+            lines.append("✅ Бот — админ группы с правом удалять сообщения (тихий режим работает полностью).")
+        else:
+            lines.append("⚠️ Бот — админ, но без права «Удаление сообщений»: команды участников не будут убираться.")
+        if not getattr(member, "can_pin_messages", False) and status != "creator":
+            lines.append("ℹ️ Нет права «Закрепление сообщений»: «Отправить и закрепить» в объявлениях не сработает.")
+    else:
+        lines.append(
+            "⚠️ Бот не админ группы: свои ответы он уберёт, а команды участников — нет, и закреплять не сможет.\n"
+            "   → Сделайте бота администратором с правом «Удаление сообщений»."
+        )
+    if getattr(member, "can_send_messages", True) is False:
+        ok = False
+        lines.append("❌ Боту запрещено писать в группу. → Разрешите ему отправку сообщений.")
+    return ok, lines
+
+
+def setup_header(ok: bool, lines: list[str]) -> str:
+    if not ok:
+        return "🔴 <b>Есть проблемы с настройкой</b>"
+    if any(line.startswith("⚠️") for line in lines):
+        return "🟠 <b>Работает, но есть замечания</b>"
+    return "🟢 <b>Настройка в порядке</b>"
+
+
+async def report_setup_to_admins(bot: Bot):
+    """При запуске пишет итог самопроверки в лог и админам в личку (без звука)."""
+    ok, lines = await check_setup(bot)
+    for line in lines:
+        (logger.info if line.startswith(("✅", "ℹ️")) else logger.warning)(f"Проверка: {line}")
+    header = "<b>Бот запущен.</b> " + setup_header(ok, lines)
+    text = header + "\n\n" + "\n".join(h(line) for line in lines)
+    for a_id in load_config().get("admin_ids", []):
+        try:
+            await tg_retry(bot.send_message, chat_id=a_id, text=text,
+                           parse_mode=ParseMode.HTML, disable_notification=True)
+        except Exception as e:
+            logger.warning(f"Не удалось написать админу {a_id} (он должен сначала нажать /start у бота): {e}")
+
+
+@dp.message(Command("check"))
+async def cmd_check(message: Message, bot: Bot):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await group_reply(message, "⛔️ Проверка настройки доступна только администраторам.")
+        return
+    ok, lines = await check_setup(bot)
+    header = setup_header(ok, lines)
+    await group_reply(message, header + "\n\n" + "\n".join(h(line) for line in lines), parse_mode=ParseMode.HTML)
+
+
 async def register_bot_commands(bot: Bot):
     """Регистрирует подсказки команд в меню Telegram"""
     private_commands = [
@@ -1892,6 +2426,7 @@ async def register_bot_commands(bot: Bot):
         BotCommand(command="duty", description="👮‍♂️ Дежурные на смене"),
         BotCommand(command="test", description="🔔 Проверить вызов на обход"),
         BotCommand(command="status", description="ℹ️ Статус системы и время"),
+        BotCommand(command="check", description="🩺 Проверить группу и права бота"),
         BotCommand(command="help", description="❓ Справка по работе бота")
     ]
     group_commands = [
@@ -1934,9 +2469,6 @@ async def main():
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-    # Регистрация меню команд
-    await register_bot_commands(bot)
-
     global scheduler_instance
     # misfire_grace_time: если запуск задержался (сон ПК, нагрузка), задача всё равно
     # выполнится в течение 5 минут, а не пропадёт молча (по умолчанию допуск 1 с)
@@ -1946,6 +2478,18 @@ async def main():
     restore_pending_escalations(scheduler, bot)
     scheduler.start()
     restore_pending_deletes(bot)
+
+    # Подсказки команд и самопроверка — в фоне: при плохой связи они могут ждать
+    # ответа Telegram минуту и дольше, а расписание и приём сообщений не должны ждать
+    async def startup_tasks():
+        await register_bot_commands(bot)
+        try:
+            await report_setup_to_admins(bot)
+        except Exception as e:
+            logger.warning(f"Самопроверка при запуске не удалась (нет связи?): {e}. Повторите позже командой /check.")
+    task = asyncio.create_task(startup_tasks())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     logger.info("Бот успешно запущен и ожидает сообщений...")
     try:

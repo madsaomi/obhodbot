@@ -3,6 +3,7 @@
   "chat_id": null,
   "timezone": "Asia/Tashkent",
   "admin_ids": [],
+  "admin_usernames": [],
   "mentions": [],
   "escalation_minutes": 15,
   "advance_minutes": 5,

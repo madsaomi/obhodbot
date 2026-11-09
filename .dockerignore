@@ -11,3 +11,6 @@ add_to_startup.bat
 remove_from_startup.bat
 bot.lock
 pending_deletes.json
+data
+deploy
+docker-compose.yml
