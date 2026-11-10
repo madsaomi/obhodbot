@@ -43,7 +43,8 @@ from aiogram.types import (
     Message,
     BotCommand,
     BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats
+    BotCommandScopeAllGroupChats,
+    BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -2250,7 +2251,7 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
     # Пересоздаём только расписание и отчёт; задачи escalation_* (идущие
     # 15-минутные проверки) не трогаем, иначе тревоги терялись бы
     for job in scheduler.get_jobs():
-        if job.id.startswith(("rem_job_", "daily_report_job")):
+        if job.id.startswith(("rem_job_", "daily_report_job", "backup_job")):
             scheduler.remove_job(job.id)
     config = load_config()
     tz_name = config.get("timezone", "Asia/Tashkent")
@@ -2301,6 +2302,23 @@ def setup_jobs(scheduler: AsyncIOScheduler, bot: Bot):
             )
         except Exception as e:
             logger.error(f"Ошибка планирования отчета {report_time}: {e}")
+
+    # Еженедельная резервная копия файлов админам в личку
+    backup_day = str(config.get("backup_weekday", "sat")).lower()
+    backup_time = str(config.get("backup_time", "19:00"))
+    if backup_day not in ("", "off", "none"):
+        try:
+            bh, bm = map(int, backup_time.split(":"))
+            scheduler.add_job(
+                send_backup,
+                trigger=CronTrigger(day_of_week=backup_day, hour=bh, minute=bm, timezone=tz),
+                args=[bot],
+                name="WeeklyBackup",
+                id="backup_job",
+                replace_existing=True
+            )
+        except Exception as e:
+            logger.error(f"Ошибка планирования резервной копии ({backup_day} {backup_time}): {e}")
 
     logger.info(f"Запланировано активных обходов: {count} из {len(reminders)}")
 
@@ -2408,6 +2426,66 @@ async def report_setup_to_admins(bot: Bot):
             logger.warning(f"Не удалось написать админу {a_id} (он должен сначала нажать /start у бота): {e}")
 
 
+# ==============================================================================
+# РЕЗЕРВНАЯ КОПИЯ
+# ==============================================================================
+
+def build_backup_files() -> list[tuple[str, bytes]]:
+    """config.json (без токена) и bot_data.json — всё, что нужно для переезда на другой сервер."""
+    config = load_config()
+    safe_config = dict(config)
+    if "bot_token" in safe_config:
+        safe_config["bot_token"] = ""  # токен живёт в .env, в копии ему не место
+    files = [("config.json", json.dumps(safe_config, ensure_ascii=False, indent=2).encode("utf-8"))]
+    if os.path.exists(DATA_PATH):
+        with open(DATA_PATH, "rb") as f:
+            files.append(("bot_data.json", f.read()))
+    return files
+
+
+async def send_backup(bot: Bot, chat_ids: list[int] | None = None, reason: str = "Еженедельная") -> int:
+    """Шлёт файлы данных админам в личку без звука. Возвращает, скольким админам дошло."""
+    config = load_config()
+    tz = pytz.timezone(config.get("timezone", "Asia/Tashkent"))
+    stamp = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
+    recipients = chat_ids if chat_ids is not None else config.get("admin_ids", [])
+    files = build_backup_files()
+    caption = (
+        f"💾 <b>{h(reason)} резервная копия</b> · {stamp}\n"
+        "Чтобы восстановить бота на новом сервере, положите эти файлы в папку данных "
+        "(на VPS: <code>/opt/obhodbot/data/</code>) и перезапустите бота."
+    )
+    delivered = 0
+    for a_id in recipients:
+        try:
+            for i, (name, content) in enumerate(files):
+                await tg_retry(
+                    bot.send_document, chat_id=a_id,
+                    document=BufferedInputFile(content, filename=name),
+                    caption=caption if i == len(files) - 1 else None,
+                    parse_mode=ParseMode.HTML, disable_notification=True
+                )
+            delivered += 1
+        except Exception as e:
+            logger.warning(f"Не удалось отправить резервную копию админу {a_id}: {e}")
+    logger.info(f"Резервная копия отправлена админам: {delivered} из {len(recipients)}")
+    return delivered
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message, bot: Bot):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await group_reply(message, "⛔️ Резервная копия доступна только администраторам.")
+        return
+    if message.chat.type != "private":
+        # Файлы с данными сотрудников не публикуем в группе
+        await group_reply(message, "📩 Напишите /backup боту в личку — копия придёт туда.")
+        return
+    sent = await send_backup(bot, [message.from_user.id], reason="Ручная")
+    if not sent:
+        await message.reply("⚠️ Не удалось отправить копию (нет связи с Telegram?). Попробуйте позже.")
+
+
 @dp.message(Command("check"))
 async def cmd_check(message: Message, bot: Bot):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -2427,6 +2505,7 @@ async def register_bot_commands(bot: Bot):
         BotCommand(command="test", description="🔔 Проверить вызов на обход"),
         BotCommand(command="status", description="ℹ️ Статус системы и время"),
         BotCommand(command="check", description="🩺 Проверить группу и права бота"),
+        BotCommand(command="backup", description="💾 Прислать резервную копию данных"),
         BotCommand(command="help", description="❓ Справка по работе бота")
     ]
     group_commands = [

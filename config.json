@@ -16,6 +16,8 @@
     "13:00",
     "18:45"
   ],
+  "backup_weekday": "sat",
+  "backup_time": "19:00",
   "keep_days": 90,
   "group_autodelete_seconds": 120,
   "reminders": [
